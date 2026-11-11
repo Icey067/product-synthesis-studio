@@ -1,0 +1,108 @@
+/* Product Synthesis Studio - Premium Dark SaaS Theme */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #F1F5F9;
+}
+
+/* Backgrounds */
+.stApp {
+    background-color: #0B0F19;
+}
+
+/* Card Containers */
+.pss-card {
+    background: #111827;
+    border: 1px solid #1F2937;
+    border-radius: 12px;
+    padding: 1.25rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -2px rgba(0, 0, 0, 0.2);
+}
+
+.pss-card-header {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #F9FAFB;
+    border-bottom: 1px solid #1F2937;
+    padding-bottom: 0.5rem;
+    margin-bottom: 0.75rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.pss-badge {
+    display: inline-block;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border-radius: 9999px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.pss-badge-high {
+    background-color: rgba(16, 185, 129, 0.2);
+    color: #34D399;
+    border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.pss-badge-medium {
+    background-color: rgba(245, 158, 11, 0.2);
+    color: #FBBF24;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.pss-badge-low {
+    background-color: rgba(239, 68, 68, 0.2);
+    color: #F87171;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+/* Stat Metric Highlight */
+.pss-stat-number {
+    font-size: 2.2rem;
+    font-weight: 700;
+    color: #38BDF8;
+    line-height: 1;
+}
+
+.pss-stat-label {
+    font-size: 0.85rem;
+    color: #94A3B8;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-top: 0.25rem;
+}
+
+/* Modern clean tables */
+.styled-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.9em;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.styled-table th {
+    background-color: #1F2937;
+    color: #F3F4F6;
+    text-align: left;
+    padding: 10px 14px;
+    font-weight: 600;
+}
+
+.styled-table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid #1F2937;
+    color: #E5E7EB;
+}
+
+.styled-table tr:hover {
+    background-color: #1A2234;
+}
+

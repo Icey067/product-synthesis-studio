@@ -1,0 +1,40 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.pyc
+
+# Local SQLite databases, temp files, and backups (auto-seeded on launch)
+*.db
+*.db-journal
+*.db.tmp
+*.db.backup
+pss_data.db
+database/pss_data.db
+database/backups/
+backups/
+
+# Generated output exports (PDFs, DOCX files)
+output/*
+!output/.gitkeep
+
+# System and OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.rar
+*.zip
+*.tar.gz
+
+# IDE and Editor configuration
+.vscode/
+.idea/
+*.swp
+*.swo

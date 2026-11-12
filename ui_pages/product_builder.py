@@ -272,25 +272,25 @@ def render_product_builder():
                         else:
                             st.error(outcome.get("message"))
 
-            with st.expander("📊 Batch progress and chapter word counts", expanded=False):
-                st.dataframe(
-                    [
-                        {
-                            "Chapter": row["chapter"],
-                            "Title": row["title"],
-                            "Words": row["words"],
-                            "Target": row["target_words"],
-                            "Status": row["status"],
-                            "Sections": f"{row['sections']['drafted']}/{row['sections']['total']}",
-                            "Sources": row["source_count"],
-                            "Locked": row["locked"],
-                            "Approved": row["approved"],
-                        }
-                        for row in batch_progress["chapters"]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+            st.markdown("##### 📊 Batch progress and chapter word counts")
+            st.dataframe(
+                [
+                    {
+                        "Chapter": row["chapter"],
+                        "Title": row["title"],
+                        "Words": row["words"],
+                        "Target": row["target_words"],
+                        "Status": row["status"],
+                        "Sections": f"{row['sections']['drafted']}/{row['sections']['total']}",
+                        "Sources": row["source_count"],
+                        "Locked": row["locked"],
+                        "Approved": row["approved"],
+                    }
+                    for row in batch_progress["chapters"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     if not chapters:
         st.info("No chapter outline generated yet. Click 'Generate 11-Chapter Outline' above.")

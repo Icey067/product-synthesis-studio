@@ -222,12 +222,14 @@ def render_market_intelligence():
                         "regardless of how many sources are imported."
                     )
                 if rejected_rows:
-                    with st.expander(f"Rejected claims ({len(rejected_rows)}) — model cited unsupported evidence"):
-                        for ev in rejected_rows:
-                            st.warning(
-                                f"[Source-{ev.get('source_id')}] `{ev.get('claim_field')}` — "
-                                f"{ev.get('verification_notes') or 'Rejected.'}"
-                            )
+                    st.markdown(
+                        f"**Rejected claims ({len(rejected_rows)}) — model cited unsupported evidence**"
+                    )
+                    for ev in rejected_rows:
+                        st.warning(
+                            f"[Source-{ev.get('source_id')}] `{ev.get('claim_field')}` — "
+                            f"{ev.get('verification_notes') or 'Rejected.'}"
+                        )
 
                 btn_col1, btn_col2 = st.columns(2)
                 with btn_col1:

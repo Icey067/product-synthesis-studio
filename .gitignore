@@ -10,6 +10,8 @@ __pycache__/
 *$py.class
 .pytest_cache/
 *.pyc
+tests/
+pytest.ini
 
 # Local SQLite databases, temp files, and backups (auto-seeded on launch)
 *.db

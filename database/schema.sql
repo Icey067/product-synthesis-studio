@@ -193,6 +193,25 @@ CREATE TABLE IF NOT EXISTS transformation_maps (
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS transformation_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    target_text TEXT NOT NULL,
+    target_value TEXT,
+    metric TEXT,
+    measurement_method TEXT,
+    population TEXT,
+    time_period TEXT,
+    target_category TEXT NOT NULL,
+    source_ids_json TEXT DEFAULT '[]',
+    evidence_status TEXT NOT NULL DEFAULT 'NOT_INDEPENDENTLY_ESTABLISHED',
+    display_label TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_transformation_targets_project ON transformation_targets(project_id);
+
 CREATE TABLE IF NOT EXISTS product_charters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL UNIQUE,
@@ -249,6 +268,7 @@ CREATE TABLE IF NOT EXISTS chapters (
     editorial_json TEXT,
     validation_status TEXT DEFAULT 'PENDING',
     validation_json TEXT,
+    lifecycle_status TEXT DEFAULT 'INCOMPLETE',
     is_locked INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -287,6 +307,10 @@ CREATE TABLE IF NOT EXISTS quality_reports (
     editorial_advisory INTEGER DEFAULT 1,
     recommendations_json TEXT,
     human_review_required INTEGER DEFAULT 0,
+    claim_summary_json TEXT,
+    repetition_summary_json TEXT,
+    architecture_summary_json TEXT,
+    gate_status TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE SET NULL
@@ -413,6 +437,8 @@ CREATE TABLE IF NOT EXISTS chapter_plans (
     planned_words INTEGER DEFAULT 0,
     target_words INTEGER DEFAULT 0,
     min_words INTEGER DEFAULT 0,
+    architecture_json TEXT,
+    evidence_plan_json TEXT,
     status TEXT DEFAULT 'PLANNED',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -436,6 +462,12 @@ CREATE TABLE IF NOT EXISTS chapter_sections (
     model TEXT,
     generation_time_ms REAL,
     error_message TEXT,
+    validation_json TEXT,
+    validation_status TEXT DEFAULT 'PENDING',
+    claim_summary_json TEXT,
+    repetition_summary_json TEXT,
+    revision INTEGER DEFAULT 0,
+    approved INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
@@ -524,5 +556,111 @@ CREATE TABLE IF NOT EXISTS application_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ---------------------------------------------------------------------------
+-- P2.2 publication quality: claims, repetition, architecture
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS chapter_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    chapter_id INTEGER NOT NULL,
+    section_id INTEGER,
+    section_key TEXT,
+    claim_key TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    claim_type TEXT NOT NULL,
+    citation_ids_json TEXT,
+    source_ids_json TEXT,
+    excerpts_json TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'UNVERIFIED',
+    confidence REAL DEFAULT 0.0,
+    human_review_status TEXT DEFAULT 'NOT_REQUIRED',
+    review_note TEXT,
+    severity TEXT DEFAULT 'MEDIUM',
+    number_check_json TEXT,
+    unit_check_json TEXT,
+    population_check_json TEXT,
+    geography_check_json TEXT,
+    time_check_json TEXT,
+    meaning_check_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+    FOREIGN KEY(section_id) REFERENCES chapter_sections(id) ON DELETE SET NULL,
+    UNIQUE(chapter_id, claim_key)
+);
+CREATE INDEX IF NOT EXISTS idx_chapter_claims_chapter ON chapter_claims(chapter_id);
+CREATE INDEX IF NOT EXISTS idx_chapter_claims_project ON chapter_claims(project_id);
+CREATE INDEX IF NOT EXISTS idx_chapter_claims_status ON chapter_claims(verification_status);
+
+CREATE TABLE IF NOT EXISTS claim_verification_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    previous_status TEXT,
+    verification_status TEXT NOT NULL,
+    human_review_status TEXT NOT NULL,
+    explanation TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(claim_id) REFERENCES chapter_claims(id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_claim_verification_events_claim ON claim_verification_events(claim_id);
+
+CREATE TABLE IF NOT EXISTS repetition_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    chapter_id INTEGER,
+    scope TEXT NOT NULL DEFAULT 'PROJECT',
+    similarity_threshold REAL DEFAULT 0.82,
+    exact_count INTEGER DEFAULT 0,
+    near_count INTEGER DEFAULT 0,
+    finding_count INTEGER DEFAULT 0,
+    critical_count INTEGER DEFAULT 0,
+    summary_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repetition_runs_project ON repetition_runs(project_id);
+
+CREATE TABLE IF NOT EXISTS repetition_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    project_id INTEGER NOT NULL,
+    chapter_id INTEGER,
+    original_chapter_id INTEGER,
+    original_chapter_number INTEGER,
+    duplicate_chapter_number INTEGER,
+    original_section TEXT,
+    duplicate_section TEXT,
+    match_type TEXT NOT NULL,
+    similarity REAL DEFAULT 0.0,
+    original_text TEXT NOT NULL,
+    duplicate_text TEXT NOT NULL,
+    recommendation TEXT,
+    severity TEXT DEFAULT 'MEDIUM',
+    resolved INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(run_id) REFERENCES repetition_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE SET NULL,
+    FOREIGN KEY(original_chapter_id) REFERENCES chapters(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repetition_findings_run ON repetition_findings(run_id);
+CREATE INDEX IF NOT EXISTS idx_repetition_findings_chapter ON repetition_findings(chapter_id);
+
+CREATE TABLE IF NOT EXISTS book_architectures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL UNIQUE,
+    architecture_json TEXT NOT NULL,
+    coverage_matrix_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PLANNED',
+    overlap_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 

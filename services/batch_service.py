@@ -230,6 +230,9 @@ class BatchService:
                 "message": result.get("message", ""),
                 "evidence": result.get("evidence", {}),
                 "consistency": result.get("consistency", {}),
+                "claims": result.get("claims", {}),
+                "repetition": result.get("repetition", {}),
+                "architecture": result.get("architecture", {}),
             }
 
         ok, content, report, message = self.generator.generate_chapter_validated(

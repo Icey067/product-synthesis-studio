@@ -32,7 +32,21 @@ RUBRIC_DIMENSIONS: Dict[str, str] = {
     "reader_engagement": "Reader engagement",
     "evidence_support": "Evidence support",
     "chapter_consistency": "Chapter consistency",
+    "citation_correctness": "Citation correctness",
+    "repetition": "Repetition (lower is better)",
+    "chapter_uniqueness": "Chapter uniqueness",
+    "reader_transformation": "Reader transformation",
+    "instruction_completeness": "Instruction completeness",
 }
+
+# Kept as the stable P2 response shape for integrations that consume the
+# original editorial rubric.  P2.2 additions are returned separately and are
+# merged into the persisted audit report by AuditService.
+CORE_RUBRIC_DIMENSIONS = (
+    "accuracy", "practical_usefulness", "depth", "clarity", "originality_risk",
+    "relevance", "logical_flow", "reader_engagement", "evidence_support",
+    "chapter_consistency",
+)
 
 RECOMMENDATION_STATUSES = {"PENDING", "APPROVED", "DISMISSED", "APPLIED"}
 
@@ -68,7 +82,11 @@ class EditorialService:
         source_count = len(sources or [])
 
         critical_issues = cls._issue_count(
-            issues, {"citation_exists", "citation_required", "unsupported_statistic", "statistic_not_in_source"}
+            issues, {
+                "citation_exists", "citation_required", "unsupported_statistic",
+                "statistic_not_in_source", "statistic_context_mismatch",
+                "unsupported_claim", "claim_human_review",
+            }
         )
         accuracy = _clamp(5.0 - critical_issues * 1.5)
 
@@ -147,6 +165,46 @@ class EditorialService:
 
         chapter_consistency = _clamp(5.0 - duplicate_ratio * 5.0)
 
+        # P2.2 explicit dimensions.
+        claim_summary = deterministic.get("claim_summary") or {}
+        repetition_summary = deterministic.get("repetition") or {}
+        unsupported_numeric = int(claim_summary.get("unsupported_numeric_count") or 0)
+        unsupported_claims = int(claim_summary.get("unsupported_count") or 0)
+        partial_claims = int(claim_summary.get("partially_verified_count") or 0)
+        citation_correctness = 5.0
+        if invalid:
+            citation_correctness = 0.0
+        elif source_count and not citation_ids:
+            citation_correctness = 1.0
+        else:
+            citation_correctness -= min(3.0, unsupported_claims * 0.75 + partial_claims * 0.35)
+        citation_correctness = _clamp(citation_correctness)
+
+        repetition_findings = int(repetition_summary.get("finding_count") or 0)
+        repetition_score = _clamp(
+            5.0 - repetition_findings * 0.6
+            - cls._issue_count(issues, {"repetition"}) * 0.4
+            - (2.0 if not repetition_summary.get("gate_ok", True) else 0.0)
+        )
+
+        overlaps = deterministic.get("architecture_overlaps") or []
+        chapter_uniqueness = _clamp(5.0 - len(overlaps) * 2.5)
+
+        all_sections = all(sections.get(k) for k in ("introduction", "step_by_step", "practical_example", "common_mistakes", "worksheet", "summary"))
+        action_step = bool(re.search(r"24[- ]hour|action step|next step", lower))
+        transformation = 1.5 + (1.5 if all_sections else 0.0) + (1.0 if action_step else 0.0)
+        if "after_state" in (chapter.get("purpose") or "").lower():
+            transformation += 0.5
+        reader_transformation = _clamp(transformation)
+
+        instruction_completeness = _clamp(
+            1.0
+            + (1.0 if all_sections else 0.0)
+            + (1.0 if sections.get("worksheet") else 0.0)
+            + (1.0 if action_step else 0.0)
+            + (1.0 if re.search(r"-\s*\[\s?\]|checklist|template|script", lower) else 0.0)
+        )
+
         scores = {
             "accuracy": accuracy,
             "practical_usefulness": practical_usefulness,
@@ -158,6 +216,11 @@ class EditorialService:
             "reader_engagement": reader_engagement,
             "evidence_support": evidence_support,
             "chapter_consistency": chapter_consistency,
+            "citation_correctness": citation_correctness,
+            "repetition": repetition_score,
+            "chapter_uniqueness": chapter_uniqueness,
+            "reader_transformation": reader_transformation,
+            "instruction_completeness": instruction_completeness,
         }
         return {
             key: {
@@ -266,12 +329,16 @@ class EditorialService:
         )
 
         dimensions: Dict[str, Any] = {}
+        publication_quality_dimensions: Dict[str, Any] = {}
         for key in RUBRIC_DIMENSIONS:
             entry = dict(deterministic_rubric[key])
             if key in advisory.get("dimensions", {}):
                 entry["advisory_score"] = advisory["dimensions"][key]["score"]
                 entry["advisory_source"] = "model_advisory"
-            dimensions[key] = entry
+            if key in CORE_RUBRIC_DIMENSIONS:
+                dimensions[key] = entry
+            else:
+                publication_quality_dimensions[key] = entry
 
         deterministic_scores = [e["score"] for e in deterministic_rubric.values()]
         deterministic_average = round(sum(deterministic_scores) / len(deterministic_scores), 2) if deterministic_scores else 0.0
@@ -294,10 +361,11 @@ class EditorialService:
 
         status = "NEEDS_REVISION" if any(
             str(i.get("severity", "")).upper() in {"CRITICAL", "HIGH"} for i in deterministic.get("issues") or []
-        ) else "REVIEWED"
+        ) or not (deterministic.get("repetition") or {}).get("gate_ok", True) else "REVIEWED"
 
         return {
             "dimensions": dimensions,
+            "publication_quality_dimensions": publication_quality_dimensions,
             "deterministic_rubric": deterministic_rubric,
             "deterministic_average": deterministic_average,
             "advisory": advisory,

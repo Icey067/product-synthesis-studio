@@ -8,6 +8,7 @@ from config.settings import (
     DEFAULT_REQUIRED_CHAPTER_COUNT,
 )
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -64,6 +65,23 @@ def _duplicate_export_file(file_path: Optional[str], new_project_id: int) -> Opt
         return str(target)
     except OSError:
         return None
+
+
+def _remap_citation_labels(content: Optional[str], source_map: Dict[int, int]) -> Optional[str]:
+    """Rewrite only complete ``[Source-N]`` / ``[Ref-N]`` labels.
+
+    A duplicated project owns new source records.  Leaving markdown citation
+    labels pointed at the old source IDs makes otherwise valid copied prose fail
+    verification, so textual citations must move with the foreign keys.
+    """
+    if content is None or not source_map:
+        return content
+
+    def replace(match: re.Match[str]) -> str:
+        prefix, raw_id = match.group(1), int(match.group(2))
+        return f"[{prefix}-{source_map.get(raw_id, raw_id)}]"
+
+    return re.sub(r"\[(Source|Ref)-(\d+)\]", replace, content, flags=re.IGNORECASE)
 
 class ProjectService:
     @staticmethod
@@ -454,6 +472,32 @@ class ProjectService:
                             record,
                             {"chapter_id": mapped_chapter, "project_id": new_id},
                         )
+
+                # Markdown content has no foreign key for source citations.
+                # Remap labels after all source and chapter IDs are known.
+                new_chapter_ids = list(chapter_map.values())
+                new_placeholders = ", ".join("?" for _ in new_chapter_ids)
+                for table, column in (
+                    ("chapters", "content"),
+                    ("chapter_sections", "content"),
+                    ("chapter_revisions", "content"),
+                    ("chapter_autosaves", "draft_content"),
+                ):
+                    if not _table_exists(cur, table):
+                        continue
+                    if table == "chapters":
+                        query = f"SELECT id, {column} FROM {table} WHERE id IN ({new_placeholders})"
+                        params = new_chapter_ids
+                    else:
+                        query = f"SELECT id, {column} FROM {table} WHERE chapter_id IN ({new_placeholders})"
+                        params = new_chapter_ids
+                    for row in cur.execute(query, params).fetchall():
+                        rewritten = _remap_citation_labels(row[column], source_map)
+                        if rewritten != row[column]:
+                            cur.execute(
+                                f"UPDATE {table} SET {column} = ? WHERE id = ?",
+                                (rewritten, row["id"]),
+                            )
 
             report_map: Dict[int, int] = {}
             if _table_exists(cur, "quality_reports"):

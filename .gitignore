@@ -13,6 +13,9 @@ __pycache__/
 tests/
 pytest.ini
 
+# Benchmark and audit markdown reports
+P2_*.md
+
 # Local SQLite databases, temp files, and backups (auto-seeded on launch)
 *.db
 *.db-journal

@@ -2,6 +2,7 @@ import streamlit as st
 from services.project_service import ProjectService
 from services.transformation_service import TransformationService
 from services.market_service import MarketService
+from services.target_integrity_service import TargetIntegrityService
 
 def render_transformation():
     st.markdown("## 🔄 Customer Transformation Map")
@@ -93,6 +94,18 @@ def render_transformation():
         st.markdown("**Measurable Results:**")
         for res in after.get("measurable_results", []):
             st.markdown(f"• {res}")
+
+    targets = TargetIntegrityService.assessment(project_id)
+    if targets["targets"]:
+        st.markdown("### 🎯 Target Integrity")
+        st.caption("Targets are planning aids. Only targets with explicit evidence may be presented as evidence-supported outcomes.")
+        for target in targets["targets"]:
+            if target["evidence_status"] == "SUPPORTED":
+                st.success(f"{target['target_text']} — evidence-supported outcome")
+            elif target["evidence_status"] == "REJECTED":
+                st.error(f"{target['target_text']} — {target['display_label']}")
+            else:
+                st.warning(f"{target['target_text']} — {target['display_label']}")
 
     st.markdown("---")
     st.markdown("### 🗺️ Step-by-Step Implementation Milestones")

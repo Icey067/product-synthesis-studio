@@ -24,6 +24,8 @@ from services.ollama_client import OllamaClient
 from services.product_format_service import contract_text
 from services.project_service import ProjectService
 from services.research_service import ResearchService, tokenize
+from services.claim_service import ClaimService
+from services.repetition_service import RepetitionService
 
 BENCHMARK_PROJECT_NAME = "MODEL BENCHMARK — temporary evaluation project"
 BENCHMARK_TOPIC = "Practical digital growth for local micro-businesses"
@@ -182,6 +184,65 @@ class ModelEvaluationService:
             "words": words,
         }
 
+    @classmethod
+    def _claim_metric(cls, project_id: int, content: str) -> Dict[str, Any]:
+        sources = ResearchService.get_sources(project_id)
+        result = ClaimService.analyze_chapter(
+            project_id, 0, content or "", sources, persist=False
+        )
+        summary = result.get("summary") or {}
+        total = int(summary.get("total_claims") or 0)
+        unsupported = int(summary.get("unsupported_count") or 0)
+        numeric = int(
+            (summary.get("by_type") or {}).get("NUMERICAL_STATISTIC", 0)
+        )
+        return {
+            "total_claims": total,
+            "numeric_claims": numeric,
+            "unsupported_claims": unsupported,
+            "unsupported_numeric": int(summary.get("unsupported_numeric_count") or 0),
+            "unsupported_claim_rate": round(unsupported / total, 3) if total else 0.0,
+            "citation_coverage": float(summary.get("citation_coverage") or 0.0),
+            "summary": {k: v for k, v in summary.items() if k != "claims"},
+        }
+
+    @classmethod
+    def _repetition_metric(cls, project_id: int, content: str) -> Dict[str, Any]:
+        chapter = {
+            "id": 0,
+            "chapter_number": 1,
+            "title": "Benchmark chapter",
+            "content": content or "",
+        }
+        result = RepetitionService.scan(project_id, [chapter], persist=False)
+        sentences = max(1, int(result.get("chapter_sentence_count") or 0))
+        return {
+            "finding_count": int(result.get("finding_count") or 0),
+            "exact_count": int(result.get("exact_count") or 0),
+            "near_count": int(result.get("near_count") or 0),
+            "repetition_rate": round(int(result.get("finding_count") or 0) / sentences, 3),
+            "by_match_type": result.get("by_match_type", {}),
+        }
+
+    @staticmethod
+    def _usefulness_metric(content: str) -> Dict[str, Any]:
+        lower = (content or "").lower()
+        signals = {
+            "ordered_steps": len(re.findall(r"\b(?:step\s+\d|first,|second,|then,|finally,)\b", lower)),
+            "worksheet": len(re.findall(r"-\s*\[\s?\]|\bworksheet\b|\bchecklist\b", lower)),
+            "example": len(re.findall(r"\bfor example\b|\bfor instance\b|\bimagine\b|\bscenario\b", lower)),
+            "action_step": len(re.findall(r"24[- ]hour|next step|action step", lower)),
+            "specific_numbers_with_citation": len(
+                re.findall(r"\d[\d,.]*\s?%[^.]{0,120}\[Source-\d+\]", content or "", re.IGNORECASE)
+            ),
+        }
+        score = min(
+            1.0,
+            sum(1 for key in ("ordered_steps", "worksheet", "example", "action_step") if signals[key])
+            / 4.0,
+        )
+        return {"score": round(score, 3), "signals": signals}
+
     # ------------------------------------------------------------------
     # Evaluation
     # ------------------------------------------------------------------
@@ -234,6 +295,9 @@ class ModelEvaluationService:
         citation = self._citation_metric(content, fixture)
         instruction = self._instruction_metric(content, target_words)
         relevance = self._topic_metric(content)
+        claims = self._claim_metric(project_id, content)
+        repetition = self._repetition_metric(project_id, content)
+        usefulness = self._usefulness_metric(content)
 
         metrics = {
             "json_valid": bool(json_result["valid"]),
@@ -245,6 +309,9 @@ class ModelEvaluationService:
             "citation": citation,
             "instruction": instruction,
             "topic_relevance": relevance,
+            "claims": claims,
+            "repetition": repetition,
+            "practical_usefulness": usefulness,
             "actual_word_count": instruction["words"],
             "model_registry": ModelRegistry.model_details(model),
         }
@@ -313,6 +380,9 @@ class ModelEvaluationService:
                 "structure": structure["score"],
                 "topic_relevance": relevance,
                 "instruction_compliance": instruction["score"],
+                "unsupported_claim_rate": claims["unsupported_claim_rate"],
+                "repetition_rate": repetition["repetition_rate"],
+                "practical_usefulness": usefulness["score"],
             },
             "rubric": rubric,
         }

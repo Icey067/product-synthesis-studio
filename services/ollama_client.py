@@ -90,7 +90,7 @@ class OllamaClient:
         if not selected_model:
             return (
                 False,
-                "No installed Ollama model is available. Pull a local model "
+                "Generation failed: no installed Ollama model is available. Pull a local model "
                 "(for example: ollama pull <model>) and select it in Settings.",
             )
         url = f"{self.base_url}/api/generate"

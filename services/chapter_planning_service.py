@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from config.prompts_p2 import (
     PROMPT_SECTION_GENERATION,
+    PROMPT_SECTION_REPAIR,
+    PROMPT_REPETITION_REWRITE,
     PROMPT_TRANSITION_CHECK,
     SECTION_SYSTEM,
 )
@@ -26,10 +28,15 @@ from services.chapter_contract import (
     CITATION_RE,
     analyze_chapter,
     count_words,
+    find_citations,
     min_publication_words,
     target_words,
 )
 from services.ollama_client import OllamaClient
+from services.claim_service import ClaimService
+from services.repetition_service import RepetitionService
+from services.book_architecture_service import BookArchitectureService
+from services.evidence_plan_service import EvidencePlanService
 from services.product_format_service import contract_text
 from services.research_service import ResearchService
 from services.retrieval_service import RetrievalService
@@ -213,12 +220,22 @@ class ChapterPlanningService:
 
         before = transformation.get("before_situation") or {}
         after = transformation.get("after_situation") or {}
+        architecture_entry = BookArchitectureService.for_chapter(project_id, int(chapter.get("id") or 0))
+        architecture_entry = (
+            dict(architecture_entry) if architecture_entry else {}
+        )
+        # Remove potentially long repeated lists from the stored plan section
+        # entries; the prompt builder reads them from the architecture object.
+        evidence_plan = EvidencePlanService.build(project_id, chapter, sources=sources)
         sections = [
             {
                 "sequence": index + 1,
                 "section_key": key,
                 "heading": heading,
                 "purpose": purpose,
+                "unique_contribution": (
+                    f"{heading} for '{chapter.get('title', '')}': {purpose}"
+                ),
                 "word_budget": budgets[index],
             }
             for index, (key, heading, purpose, _share) in enumerate(SECTION_BLUEPRINT)
@@ -232,6 +249,8 @@ class ChapterPlanningService:
             "learning_objectives": cls._as_list(chapter.get("learning_objectives")),
             "key_topics": cls._as_list(chapter.get("key_topics")),
             "expected_outcome": chapter.get("expected_outcome", ""),
+            "architecture": architecture_entry,
+            "evidence_plan": evidence_plan,
             "product_format": chapter.get("product_format") or project.get("product_format") or "Ebook",
             "country": project.get("country", "India"),
             "language": project.get("language", "English"),
@@ -284,13 +303,16 @@ class ChapterPlanningService:
             conn.execute(
                 """
                 INSERT INTO chapter_plans (
-                    project_id, chapter_id, plan_json, planned_words, target_words, min_words, status
-                ) VALUES (?, ?, ?, ?, ?, ?, 'PLANNED')
+                    project_id, chapter_id, plan_json, planned_words, target_words, min_words,
+                    architecture_json, evidence_plan_json, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PLANNED')
                 ON CONFLICT(chapter_id) DO UPDATE SET
                     plan_json = excluded.plan_json,
                     planned_words = excluded.planned_words,
                     target_words = excluded.target_words,
                     min_words = excluded.min_words,
+                    architecture_json = excluded.architecture_json,
+                    evidence_plan_json = excluded.evidence_plan_json,
                     status = 'PLANNED',
                     updated_at = CURRENT_TIMESTAMP
                 """,
@@ -301,6 +323,8 @@ class ChapterPlanningService:
                     plan["planned_words"],
                     plan["target_words"],
                     plan["min_words"],
+                    json.dumps(plan.get("architecture") or {}),
+                    json.dumps(plan.get("evidence_plan") or {}),
                 ),
             )
             conn.execute("DELETE FROM chapter_sections WHERE chapter_id = ?", (chapter_id,))
@@ -343,6 +367,18 @@ class ChapterPlanningService:
             plan.setdefault("target_words", record.get("target_words") or 0)
             plan.setdefault("min_words", record.get("min_words") or 0)
             plan.setdefault("planned_words", record.get("planned_words") or 0)
+            try:
+                plan.setdefault(
+                    "architecture", json.loads(record.get("architecture_json") or "{}")
+                )
+            except (TypeError, ValueError):
+                plan.setdefault("architecture", {})
+            try:
+                plan.setdefault(
+                    "evidence_plan", json.loads(record.get("evidence_plan_json") or "{}")
+                )
+            except (TypeError, ValueError):
+                plan.setdefault("evidence_plan", {})
             plan["plan_status"] = record.get("status")
             return plan
 
@@ -382,6 +418,295 @@ class ChapterPlanningService:
         )
         return evidence
 
+    # ------------------------------------------------------------------
+    # Section-level validation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _defect(code: str, severity: str, detail: str, correction: str) -> Dict[str, str]:
+        return {
+            "code": code,
+            "severity": severity,
+            "detail": detail,
+            "correction": correction,
+        }
+
+    def _section_repetition(self, project_id: int, chapter_id: int) -> List[Dict[str, Any]]:
+        from services.outline_service import OutlineService
+
+        chapters = OutlineService.get_chapters(project_id)
+        for chapter in chapters:
+            if int(chapter.get("id") or 0) == int(chapter_id):
+                chapter["content"] = self.assemble_chapter(chapter_id)
+        try:
+            result = RepetitionService.scan(project_id, chapters, persist=False)
+        except Exception:
+            return []
+        return [
+            finding for finding in result.get("findings", [])
+            if int(finding.get("chapter_id") or 0) == int(chapter_id)
+        ][:12]
+
+    def validate_section(
+        self,
+        project_id: int,
+        chapter_id: int,
+        section_key: str,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Validate one generated section without approving the chapter.
+
+        Checks the claims in the section, citation IDs, repetition against the
+        rest of the manuscript and the intended word budget.  Approved sections
+        are never touched.
+        """
+        sections = self.get_sections(chapter_id)
+        section = next((s for s in sections if s["section_key"] == section_key), None)
+        if not section:
+            return {"status": "FAILED", "defects": [self._defect(
+                "missing_section", "HIGH", f"Unknown section '{section_key}'.", "Rebuild the plan."
+            )]}
+        content = (section.get("content") or "").strip()
+        budget = int(section.get("word_budget") or 0)
+        words = count_words(content)
+        sources = ResearchService.get_sources(project_id)
+        source_ids = {int(s.get("id")) for s in sources if s.get("id") is not None}
+        if evidence and evidence.get("items"):
+            source_ids = {int(item["source_id"]) for item in evidence["items"]}
+        cited = find_citations(content)
+        invalid = [cid for cid in cited if cid not in source_ids] if source_ids else list(cited) if cited and not sources else []
+
+        claim_result = ClaimService.analyze_chapter(
+            project_id, chapter_id, content, sources, persist=False
+        )
+        claim_summary = claim_result.get("summary") or {}
+        claims = claim_result.get("claims") or []
+        repetition_findings = self._section_repetition(project_id, chapter_id)
+
+        defects: List[Dict[str, str]] = []
+        for cid in invalid:
+            defects.append(self._defect(
+                "invalid_citation", "CRITICAL",
+                f"[Source-{cid}] does not exist in this project's research library.",
+                f"Remove [Source-{cid}] or cite an available source.",
+            ))
+        for claim in claims:
+            status = claim.get("verification_status")
+            numbers = [
+                n.get("raw") for n in (claim.get("number_check", {}).get("numbers") or [])
+                if n.get("raw")
+            ]
+            if status == "UNSUPPORTED" and numbers:
+                defects.append(self._defect(
+                    "unsupported_numeric", "CRITICAL",
+                    f"Unsupported number(s) {', '.join(numbers)}: {claim['claim_text'][:180]}",
+                    "Remove the number or replace the claim with a qualified qualitative statement.",
+                ))
+            elif status == "UNSUPPORTED":
+                defects.append(self._defect(
+                    "unsupported_claim", "HIGH",
+                    f"Unsupported factual claim: {claim['claim_text'][:180]}",
+                    "Add a supporting source or rewrite as general explanatory material.",
+                ))
+            elif status == "PARTIALLY_VERIFIED":
+                defects.append(self._defect(
+                    "partially_verified_claim", "HIGH",
+                    f"Claim is only partially verified: {claim['claim_text'][:180]}",
+                    claim.get("review_note") or "Verify the missing context or narrow the claim.",
+                ))
+        for finding in repetition_findings:
+            defects.append(self._defect(
+                "repetition", finding.get("severity", "MEDIUM"),
+                f"{finding.get('match_label')} (similarity {finding.get('similarity')}): "
+                f"{str(finding.get('duplicate_text'))[:180]}",
+                finding.get("recommendation") or "Rewrite with chapter-specific substance.",
+            ))
+        if budget and content and words < int(budget * 0.45):
+            defects.append(self._defect(
+                "under_budget", "MEDIUM",
+                f"{words} words against a {budget}-word budget.",
+                "Expand with concrete, non-repetitive detail.",
+            ))
+        if budget and words > int(budget * 1.6):
+            defects.append(self._defect(
+                "over_budget", "MEDIUM",
+                f"{words} words against a {budget}-word budget.",
+                "Trim repetition or move detail to a more relevant section.",
+            ))
+
+        critical = any(d["severity"] == "CRITICAL" for d in defects)
+        validation_status = "NEEDS_REVISION" if defects else "APPROVED"
+        if content and not defects:
+            validation_status = "APPROVED"
+        validation = {
+            "status": validation_status,
+            "word_count": words,
+            "word_budget": budget,
+            "budget_ok": not any(d["code"] in {"under_budget", "over_budget"} for d in defects),
+            "citation_ids": cited,
+            "invalid_citations": invalid,
+            "claim_summary": {k: v for k, v in claim_summary.items() if k != "claims"},
+            "claims": claims,
+            "repetition_summary": {
+                "finding_count": len(repetition_findings),
+                "gate_ok": len(repetition_findings) <= int(RepetitionService.thresholds()["max_per_chapter"]),
+            },
+            "repetition_findings": repetition_findings,
+            "defects": defects,
+            "critical": critical,
+        }
+        with transaction() as conn:
+            conn.execute(
+                """
+                UPDATE chapter_sections
+                SET validation_json = ?, validation_status = ?, claim_summary_json = ?,
+                    repetition_summary_json = ?, approved = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(validation),
+                    validation_status,
+                    json.dumps(validation["claim_summary"]),
+                    json.dumps(validation["repetition_summary"]),
+                    1 if validation_status == "APPROVED" else 0,
+                    section["id"],
+                ),
+            )
+        return validation
+
+    def repair_section(
+        self,
+        project_id: int,
+        chapter_id: int,
+        section_key: str,
+        validation: Optional[Dict[str, Any]] = None,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Generate a correction for one section only, preserving all others."""
+        plan = self.get_plan(chapter_id) or {}
+        sections = self.get_sections(chapter_id)
+        section = next((s for s in sections if s["section_key"] == section_key), None)
+        if not section:
+            return {"ok": False, "error": f"Unknown section '{section_key}'."}
+        validation = validation or self.validate_section(
+            project_id, chapter_id, section_key, evidence=evidence
+        )
+        if validation.get("status") == "APPROVED":
+            return {"ok": True, "skipped": True, "validation": validation}
+
+        evidence = evidence or self._evidence_for_chapter(project_id, plan)
+        valid_ids = {int(item["source_id"]) for item in evidence.get("items", [])}
+        context = evidence.get("context") or ""
+        evidence_plan = plan.get("evidence_plan") or EvidencePlanService.get(chapter_id) or {}
+        architecture = plan.get("architecture") or {}
+        budget = int(section.get("word_budget") or 0)
+        defects_text = "\n".join(
+            f"- [{d['severity']}] {d['code']}: {d['detail']} Correction: {d['correction']}"
+            for d in validation.get("defects", [])
+        ) or "- General quality improvement."
+        missing = "\n".join(
+            f"- {m.get('topic')}: {m.get('reason')} (search: {m.get('research_query')})"
+            for m in evidence_plan.get("missing_evidence", [])
+        ) or "None identified."
+
+        prompt = PROMPT_SECTION_REPAIR.format(
+            chapter_number=plan.get("chapter_number", 0),
+            chapter_title=plan.get("title", ""),
+            heading=section["heading"],
+            unique_contribution=section.get("plan_notes") or section["heading"],
+            section_purpose=section.get("plan_notes") or "",
+            word_budget=budget,
+            word_cap=int(budget * 1.35) if budget else 0,
+            defects=defects_text,
+            evidence_context=context,
+            missing_evidence=missing,
+            must_not_repeat=", ".join((architecture.get("must_not_repeat") or [])[:20]) or "None recorded.",
+            current_section=wrap_untrusted_content(
+                section.get("content") or "", label="CURRENT_SECTION"
+            ),
+        )
+        prompt += "\n\nBOOK ARCHITECTURE:\n" + BookArchitectureService.prompt_block(architecture)
+        prompt += "\n\nEVIDENCE PLAN:\n" + EvidencePlanService.prompt_block(evidence_plan)
+
+        started = time.time()
+        ok, response = self.ai.generate(
+            prompt=prompt,
+            system=SECTION_SYSTEM,
+            temperature=0.45,
+            timeout=300,
+            task="editing",
+        )
+        elapsed_ms = round((time.time() - started) * 1000, 1)
+        if not ok:
+            with transaction() as conn:
+                conn.execute(
+                    "UPDATE chapter_sections SET status = 'FAILED', error_message = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (str(response)[:500], section["id"]),
+                )
+            return {"ok": False, "section_key": section_key, "error": response}
+
+        content = (response or "").strip()
+        content, removed = self._strip_invalid_citations(content, valid_ids)
+        if not content.lstrip().lower().startswith("##"):
+            content = f"## {section['heading']}\n\n" + content
+        words = count_words(content)
+        with transaction() as conn:
+            conn.execute(
+                """
+                UPDATE chapter_sections
+                SET content = ?, word_count = ?, status = 'DRAFTED', revision = revision + 1,
+                    validation_status = 'PENDING', approved = 0, model = ?,
+                    generation_time_ms = ?, error_message = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    content,
+                    words,
+                    getattr(self.ai, "_get_selected_model", lambda task=None: None)("editing"),
+                    elapsed_ms,
+                    section["id"],
+                ),
+            )
+        rechecked = self.validate_section(project_id, chapter_id, section_key, evidence=evidence)
+        return {
+            "ok": True,
+            "section_key": section_key,
+            "content": content,
+            "word_count": words,
+            "revision": int(section.get("revision") or 0) + 1,
+            "validation": rechecked,
+            "invalid_citations_removed": removed,
+            "generation_time_ms": elapsed_ms,
+        }
+
+    def rewrite_repetition_passage(
+        self,
+        project_id: int,
+        chapter_id: int,
+        finding: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Ask the writer to rewrite one duplicated passage (never auto-approves)."""
+        plan = self.get_plan(chapter_id) or {}
+        architecture = plan.get("architecture") or {}
+        prompt = PROMPT_REPETITION_REWRITE.format(
+            chapter_number=plan.get("chapter_number", 0),
+            chapter_title=plan.get("title", ""),
+            architecture_block=BookArchitectureService.prompt_block(architecture),
+            original_text=finding.get("original_text", ""),
+            duplicate_text=finding.get("duplicate_text", ""),
+            recommendation=finding.get("recommendation", ""),
+        )
+        ok, response = self.ai.generate(
+            prompt=prompt,
+            system=SECTION_SYSTEM,
+            temperature=0.5,
+            timeout=240,
+            task="editing",
+        )
+        if not ok:
+            return {"ok": False, "error": response}
+        return {"ok": True, "replacement": (response or "").strip()}
+
     def generate_section(
         self,
         project_id: int,
@@ -391,8 +716,9 @@ class ChapterPlanningService:
         evidence: Optional[Dict[str, Any]] = None,
         previous_sections: Optional[List[str]] = None,
         allow_approved_overwrite: bool = False,
+        auto_repair: bool = True,
     ) -> Dict[str, Any]:
-        """Generate and persist one section.  Drafted sections are reused."""
+        """Generate, validate and (if needed) repair one section."""
         from services.manuscript_service import ManuscriptService
 
         if (
@@ -419,14 +745,40 @@ class ChapterPlanningService:
         target_section = next((s for s in sections if s["section_key"] == section_key), None)
         if target_section is None:
             return {"ok": False, "error": f"Unknown section '{section_key}'."}
-        if target_section["status"] == "DRAFTED" and not force and (target_section.get("content") or "").strip():
-            return {
-                "ok": True,
-                "skipped": True,
-                "section_key": section_key,
-                "content": target_section["content"],
-                "word_count": target_section["word_count"],
-            }
+        has_content = bool((target_section.get("content") or "").strip())
+        validation_status = (target_section.get("validation_status") or "PENDING").upper()
+        if not force and has_content:
+            approved_section = bool(target_section.get("approved")) or validation_status == "APPROVED"
+            if approved_section:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "section_key": section_key,
+                    "content": target_section["content"],
+                    "word_count": target_section["word_count"],
+                    "validation_status": validation_status,
+                }
+            # An existing draft from an earlier version or a failed repair must be
+            # checked before it is either kept or corrected.  Only this section
+            # is touched; approved sections are never overwritten.
+            existing_validation = self.validate_section(
+                project_id, chapter_id, section_key, evidence=evidence
+            )
+            if existing_validation.get("status") == "APPROVED":
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "section_key": section_key,
+                    "content": target_section["content"],
+                    "word_count": target_section["word_count"],
+                    "validation_status": "APPROVED",
+                    "validation": existing_validation,
+                }
+            if auto_repair:
+                return self.repair_section(
+                    project_id, chapter_id, section_key,
+                    validation=existing_validation, evidence=evidence,
+                )
 
         evidence = evidence or self._evidence_for_chapter(project_id, plan)
         valid_ids = {int(item["source_id"]) for item in evidence.get("items", [])}
@@ -452,6 +804,8 @@ class ChapterPlanningService:
             ]
 
         product = plan.get("product_context", {})
+        architecture = plan.get("architecture") or {}
+        evidence_plan = plan.get("evidence_plan") or EvidencePlanService.get(chapter_id) or {}
         budget = int(target_section.get("word_budget") or 0)
         prompt = PROMPT_SECTION_GENERATION.format(
             sequence=target_section["sequence"],
@@ -482,6 +836,12 @@ class ChapterPlanningService:
             ),
             min_citations=1 if valid_ids else 0,
         )
+        prompt += "\n\nUNIQUE CONTRIBUTION OF THIS SECTION:\n" + (
+            f"{target_section['heading']} for '{plan.get('title', '')}': "
+            f"{target_section.get('plan_notes') or ''}"
+        )
+        prompt += "\n\nBOOK ARCHITECTURE (do not repeat earlier chapters):\n" + BookArchitectureService.prompt_block(architecture)
+        prompt += "\n\nCHAPTER EVIDENCE PLAN:\n" + EvidencePlanService.prompt_block(evidence_plan)
         prompt += "\n\nFORMAT CONTRACT:\n" + contract_text(plan.get("product_format", "Ebook"))
 
         started = time.time()
@@ -515,11 +875,28 @@ class ChapterPlanningService:
                 """
                 UPDATE chapter_sections
                 SET content = ?, word_count = ?, status = 'DRAFTED', model = ?,
-                    generation_time_ms = ?, error_message = NULL, updated_at = CURRENT_TIMESTAMP
+                    generation_time_ms = ?, error_message = NULL,
+                    validation_status = 'PENDING', approved = 0,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (content, words, model_name, elapsed_ms, target_section["id"]),
             )
+
+        validation = self.validate_section(project_id, chapter_id, section_key, evidence=evidence)
+        repaired = False
+        if validation.get("status") != "APPROVED" and auto_repair:
+            repair = self.repair_section(
+                project_id, chapter_id, section_key,
+                validation=validation, evidence=evidence,
+            )
+            repaired = bool(repair.get("ok"))
+            if repaired:
+                validation = repair.get("validation") or {
+                    "status": "NEEDS_REVISION", "defects": []
+                }
+                content = repair.get("content") or content
+                words = int(repair.get("word_count") or words)
 
         return {
             "ok": True,
@@ -531,6 +908,9 @@ class ChapterPlanningService:
             "generation_time_ms": elapsed_ms,
             "model": model_name,
             "invalid_citations_removed": removed,
+            "validation_status": validation.get("status"),
+            "validation": validation,
+            "repaired": repaired,
         }
 
     def generate_next_section(
@@ -540,10 +920,22 @@ class ChapterPlanningService:
         force: bool = False,
     ) -> Dict[str, Any]:
         sections = self.get_sections(chapter_id)
+        # Continue forward before attempting another repair.  An earlier draft
+        # marked NEEDS_REVISION remains visible for targeted repair, but cannot
+        # trap a resumable batch on its first defective section.
         pending = next(
             (s for s in sections if s["status"] in ("PLANNED", "FAILED")),
             None,
         )
+        if pending is None:
+            pending = next(
+                (
+                    s for s in sections
+                    if (s.get("content") or "").strip()
+                    and (s.get("validation_status") or "PENDING").upper() != "APPROVED"
+                ),
+                None,
+            )
         if pending is None:
             return {"ok": True, "done": True, "sections": sections}
         result = self.generate_section(project_id, chapter_id, pending["section_key"], force=force)
@@ -631,12 +1023,29 @@ class ChapterPlanningService:
                         "recommendation": "Trim repetition or move detail to a more relevant section.",
                     }
                 )
+            validation_status = (section.get("validation_status") or "PENDING").upper()
+            if validation_status != "APPROVED":
+                issues.append(
+                    {
+                        "section": section["section_key"],
+                        "problem": "section_not_approved",
+                        "detail": f"{section['heading']} is {validation_status}.",
+                        "recommendation": "Run the section validator and repair only this section.",
+                    }
+                )
 
         drafted = [s for s in sections if s["status"] == "DRAFTED"]
+        approved_sections = [
+            s for s in sections
+            if (s.get("approved") or (s.get("validation_status") or "").upper() == "APPROVED")
+            and (s.get("content") or "").strip()
+        ]
         return {
             "issues": issues,
             "section_count": len(sections),
             "drafted_count": len(drafted),
+            "approved_section_count": len(approved_sections),
+            "all_sections_approved": len(approved_sections) == len(sections) and bool(sections),
             "word_count": count_words(content),
             "complete_sections": len(drafted) == len(sections) and bool(sections),
         }
@@ -701,7 +1110,13 @@ class ChapterPlanningService:
             failures = 0
             generated: List[Dict[str, Any]] = []
             for section in self.get_sections(chapter_id):
-                if section["status"] == "DRAFTED" and (section.get("content") or "").strip():
+                if (
+                    (section.get("content") or "").strip()
+                    and (
+                        section.get("approved")
+                        or (section.get("validation_status") or "").upper() == "APPROVED"
+                    )
+                ):
                     continue
                 result = self.generate_section(
                     project_id,
@@ -730,6 +1145,14 @@ class ChapterPlanningService:
                 source_ids=[int(item["source_id"]) for item in evidence.get("items", [])],
                 product_format=plan.get("product_format", "Ebook"),
             )
+
+            claim_result = ClaimService.analyze_chapter(
+                project_id, chapter_id, content, ResearchService.get_sources(project_id),
+                persist=True,
+            )
+            repetition_result = RepetitionService.scan_project(project_id, persist=True)
+            chapter_repetition = RepetitionService.chapter_summary(chapter_id)
+            architecture_result = BookArchitectureService.gate(project_id)
 
             saved = False
             message = ""
@@ -788,6 +1211,18 @@ class ChapterPlanningService:
                     "source_ids": [s["id"] for s in evidence.get("sources", [])],
                 },
                 "sections_generated": len(generated),
+                "claims": {
+                    "summary": {k: v for k, v in (claim_result.get("summary") or {}).items() if k != "claims"},
+                },
+                "repetition": {
+                    "project": {k: v for k, v in repetition_result.items() if k != "findings"},
+                    "chapter": {k: v for k, v in chapter_repetition.items() if k != "findings"},
+                },
+                "architecture": {
+                    "ok": architecture_result.get("ok"),
+                    "overlap_count": architecture_result.get("overlap_count"),
+                    "overlaps": architecture_result.get("overlaps", []),
+                },
                 "message": message,
             }
         finally:

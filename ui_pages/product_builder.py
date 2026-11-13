@@ -18,6 +18,9 @@ from services.chapter_planning_service import ChapterPlanningService
 from services.batch_service import BatchService
 from services.retrieval_service import RetrievalService
 from services.editorial_service import EditorialService
+from services.book_architecture_service import BookArchitectureService
+from services.claim_service import ClaimService
+from services.repetition_service import RepetitionService
 from services.chapter_contract import (
     analyze_chapter,
     count_words,
@@ -483,6 +486,67 @@ def render_product_builder():
             )
         elif not plan:
             st.caption("No research trace stored for this chapter yet.")
+
+        # Publication-quality evidence remains visible beside the section
+        # controls, so a writer can repair only the affected material.
+        claims = ClaimService.list_claims(chapter_id)
+        if claims:
+            st.markdown("**Claim verification for this chapter**")
+            st.dataframe(
+                [
+                    {
+                        "Claim": claim["claim_text"][:180],
+                        "Type": claim["claim_type"],
+                        "Status": claim["verification_status"],
+                        "Human review": claim["human_review_status"],
+                        "Sources": ", ".join(str(i) for i in claim.get("source_ids", [])) or "—",
+                    }
+                    for claim in claims
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        repetition = RepetitionService.chapter_summary(chapter_id)
+        if repetition.get("finding_count"):
+            st.warning(
+                f"Repetition scan found {repetition['finding_count']} passage(s) involving this chapter. "
+                "Use the Quality Auditor to inspect passages and verify the rewrite."
+            )
+
+    with st.expander("🧭 Manuscript-wide coverage and repetition", expanded=False):
+        architecture = BookArchitectureService.build(project_id)
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            if st.button("Refresh Coverage Matrix", key=f"coverage_{project_id}", use_container_width=True):
+                architecture = BookArchitectureService.build(project_id, force=True)
+                st.success("Coverage matrix refreshed.")
+        with ac2:
+            if st.button("Run Manuscript Repetition Scan", key=f"repetition_{project_id}", use_container_width=True):
+                with st.spinner("Comparing the manuscript for repeated passages..."):
+                    scan = RepetitionService.scan_project(project_id, persist=True)
+                st.success(f"Repetition scan complete: {scan['finding_count']} finding(s).")
+                st.rerun()
+        st.caption(
+            f"Architecture: {architecture.get('status', 'PLANNED')} · "
+            f"purpose overlaps: {architecture.get('overlap_count', 0)}"
+        )
+        matrix = architecture.get("coverage_matrix") or []
+        if matrix:
+            st.dataframe(
+                [
+                    {
+                        "Chapter": row.get("chapter"),
+                        "Purpose": row.get("unique_purpose"),
+                        "Question": row.get("main_question_answered"),
+                        "Must not repeat": ", ".join(row.get("must_not_repeat") or [])[:180],
+                        "Unique": "Yes" if row.get("unique") else "No",
+                    }
+                    for row in matrix
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     # Actions row
     c_gen, c_lock, c_audit = st.columns([2, 1, 1])

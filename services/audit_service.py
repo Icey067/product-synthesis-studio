@@ -73,6 +73,9 @@ class AuditService:
                 "score": deterministic["score"],
                 "checks": deterministic["checks"],
                 "issues": deterministic["issues"],
+                "claim_summary": deterministic.get("claim_summary", {}),
+                "repetition": deterministic.get("repetition", {}),
+                "architecture_overlaps": deterministic.get("architecture_overlaps", []),
                 "word_count": structure["word_count"],
                 "target_words": structure["target_words"],
                 "missing_sections": structure["missing_sections"],
@@ -162,7 +165,9 @@ class AuditService:
             i["message"] for i in deterministic["issues"]
             if i["check"] in {
                 "citation_exists", "citation_required", "unsupported_statistic",
-                "statistic_not_in_source", "claim_source_relevance", "weak_claim_support",
+                "statistic_not_in_source", "statistic_context_mismatch",
+                "claim_source_relevance", "weak_claim_support", "unsupported_claim",
+                "claim_human_review",
             }
         ] + model_unsupported
 
@@ -182,7 +187,10 @@ class AuditService:
             "score": score,
             "factual_accuracy_assessment": factual_assessment,
             "unsupported_statements": unsupported,
-            "repetition_issues": [i["message"] for i in deterministic["issues"] if i["check"] == "repetition"] + model_repetition,
+            "repetition_issues": [
+                i["message"] for i in deterministic["issues"]
+                if i["check"] in {"repetition", "repetition_threshold"}
+            ] + model_repetition,
             "readability_score": str(model.get("readability_score", "Not assessed")),
             "practical_value_assessment": str(model.get("practical_value_assessment", "Not assessed")),
             "recommended_corrections": corrections,
@@ -197,11 +205,30 @@ class AuditService:
                 "issues": deterministic["issues"],
                 "counts": deterministic["counts"],
                 "raw_score": deterministic["score"],
+                "claim_summary": deterministic.get("claim_summary", {}),
+                "repetition": deterministic.get("repetition", {}),
+                "architecture_overlaps": deterministic.get("architecture_overlaps", []),
             },
             "issues": deterministic["issues"],
             "human_review_required": human_review,
             "model_assessment_available": bool(model_ok),
-            "editorial_rubric": editorial.get("dimensions", {}),
+            "claim_summary": deterministic.get("claim_summary", {}),
+            "claims": deterministic.get("claims", []),
+            "repetition_summary": deterministic.get("repetition", {}),
+            "repetition_findings": deterministic.get("repetition_findings", []),
+            "architecture_summary": {
+                "ok": bool(deterministic.get("architecture", {}).get("ok", True)),
+                "overlap_count": int(deterministic.get("architecture", {}).get("overlap_count") or 0),
+                "overlaps": deterministic.get("architecture_overlaps", []),
+            },
+            "gate_status": (
+                "PASS" if status == "PASS"
+                else ("HUMAN_REVIEW" if human_review else "BLOCKED")
+            ),
+            "editorial_rubric": {
+                **(editorial.get("dimensions", {}) or {}),
+                **(editorial.get("publication_quality_dimensions", {}) or {}),
+            },
             "editorial_deterministic": editorial.get("deterministic_rubric", {}),
             "editorial_advisory": editorial.get("advisory", {}),
             "editorial_advisory_available": bool(editorial.get("advisory_available")),
@@ -219,8 +246,9 @@ class AuditService:
                     unsupported_statements_json, repetition_issues_json, readability_score,
                     practical_value_assessment, recommended_corrections_json, disclaimer_flags_json,
                     summary_verdict, deterministic_checks_json, issues_json, human_review_required,
-                    editorial_rubric_json, editorial_advisory, recommendations_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    editorial_rubric_json, editorial_advisory, recommendations_json,
+                    claim_summary_json, repetition_summary_json, architecture_summary_json, gate_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -241,6 +269,10 @@ class AuditService:
                     json.dumps(data["editorial_rubric"]),
                     1 if data["editorial_advisory_available"] else 0,
                     json.dumps(data["recommendations"]),
+                    json.dumps(data["claim_summary"]),
+                    json.dumps(data["repetition_summary"]),
+                    json.dumps(data["architecture_summary"]),
+                    data["gate_status"],
                 ),
             )
             report_id = cur.lastrowid
@@ -256,7 +288,7 @@ class AuditService:
                 """
                 UPDATE chapters
                 SET editorial_status = ?, structural_complete = ?, evidence_complete = ?,
-                    actual_word_count = ?, updated_at = CURRENT_TIMESTAMP
+                    actual_word_count = ?, lifecycle_status = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (
@@ -264,6 +296,11 @@ class AuditService:
                     1 if not structure.get("missing_sections") else 0,
                     1 if structure.get("citation_ids") and not structure.get("invalid_citations") else 0,
                     int(structure.get("word_count") or 0),
+                    (
+                        "APPROVED" if status == "PASS"
+                        else "HUMAN_REVIEW_REQUIRED" if human_review
+                        else "NEEDS_REVISION"
+                    ),
                     chapter["id"],
                 ),
             )
@@ -302,6 +339,10 @@ class AuditService:
                 d["issues"] = json.loads(d["issues_json"]) if d.get("issues_json") else []
                 d["editorial_rubric"] = json.loads(d["editorial_rubric_json"]) if d.get("editorial_rubric_json") else {}
                 d["recommendations"] = json.loads(d["recommendations_json"]) if d.get("recommendations_json") else []
+                d["claim_summary"] = json.loads(d["claim_summary_json"]) if d.get("claim_summary_json") else {}
+                d["repetition_summary"] = json.loads(d["repetition_summary_json"]) if d.get("repetition_summary_json") else {}
+                d["architecture_summary"] = json.loads(d["architecture_summary_json"]) if d.get("architecture_summary_json") else {}
+                d["gate_status"] = d.get("gate_status") or ""
                 d["editorial_advisory_available"] = bool(d.get("editorial_advisory"))
                 d["human_review_required"] = bool(d.get("human_review_required"))
                 return d

@@ -61,7 +61,9 @@ class ManuscriptService:
         with get_connection() as conn:
             row = conn.execute(
                 """
-                SELECT status, score, human_review_required, deterministic_checks_json
+                SELECT status, score, human_review_required, deterministic_checks_json,
+                       claim_summary_json, repetition_summary_json,
+                       architecture_summary_json, gate_status
                 FROM quality_reports
                 WHERE chapter_id = ?
                 ORDER BY id DESC LIMIT 1
@@ -99,6 +101,52 @@ class ManuscriptService:
         if bool(audit.get("human_review_required")):
             return True
         return str(audit.get("status", "")).upper() == "REQUIRES_HUMAN_VERIFICATION"
+
+    @staticmethod
+    def _json_field(audit: Optional[Dict[str, Any]], key: str) -> Dict[str, Any]:
+        if not audit:
+            return {}
+        raw = audit.get(key)
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (TypeError, ValueError):
+            return {}
+
+    @classmethod
+    def _audit_gate_failures(cls, audit: Optional[Dict[str, Any]]) -> List[str]:
+        """Hard P2.2 gate failures recorded by the deterministic auditor.
+
+        Legacy reports without the new fields are handled by the existing
+        deterministic-audit and citation checks; they are not retroactively
+        rewritten.  Any P2.2 report that records an unsupported numerical claim,
+        excessive repetition or a purpose overlap is blocked here.
+        """
+        if not audit:
+            return []
+        failures: List[str] = []
+        claim = cls._json_field(audit, "claim_summary_json")
+        if int(claim.get("unsupported_numeric_count") or 0) > 0:
+            failures.append(
+                f"{int(claim.get('unsupported_numeric_count'))} unsupported numerical claim(s)"
+            )
+        if int(claim.get("critical_count") or 0) > 0 and not claim.get("unsupported_numeric_count"):
+            failures.append(f"{int(claim.get('critical_count'))} critical claim defect(s)")
+        repetition = cls._json_field(audit, "repetition_summary_json")
+        if repetition and repetition.get("gate_ok") is False:
+            failures.append(
+                f"repetition exceeds the configured threshold "
+                f"({int(repetition.get('finding_count') or 0)} findings)"
+            )
+        architecture = cls._json_field(audit, "architecture_summary_json")
+        if int(architecture.get("overlap_count") or 0) > 0:
+            failures.append(
+                f"chapter purpose overlaps {int(architecture.get('overlap_count'))} other chapter(s)"
+            )
+        if str(audit.get("gate_status") or "").upper() == "BLOCKED":
+            failures.append("deterministic publication gate is BLOCKED")
+        return failures
 
     @classmethod
     def chapter_is_approved(cls, chapter_id: int) -> bool:
@@ -200,6 +248,7 @@ class ManuscriptService:
         missing_chapters: List[Dict[str, Any]] = []
         unapproved: List[int] = []
         citation_issues: List[Dict[str, Any]] = []
+        gate_blocked_chapters: List[int] = []
         chapter_details: List[Dict[str, Any]] = []
 
         for ch in chapters:
@@ -214,8 +263,9 @@ class ManuscriptService:
             is_long_enough = is_written and words >= min_words
 
             audit = cls._latest_audit(ch["id"]) if ch.get("id") else None
-            approved = cls._audit_is_verified(audit)
-            needs_human = cls._audit_requires_human(audit)
+            gate_failures = cls._audit_gate_failures(audit)
+            approved = cls._audit_is_verified(audit) and not gate_failures
+            needs_human = cls._audit_requires_human(audit) or bool(gate_failures)
 
             citations = (
                 CitationService.verify_chapter_citations(project_id, content)
@@ -260,10 +310,21 @@ class ManuscriptService:
                 approved_chapters.append(number)
             if needs_human:
                 human_review_chapters.append(number)
+            if gate_failures:
+                gate_blocked_chapters.append(number)
             if is_complete and approved and chapter_citation_ok:
                 publication_ready_chapters.append(number)
             if is_complete and not approved:
                 unapproved.append(number)
+
+            lifecycle = (
+                "APPROVED" if approved
+                else "HUMAN_REVIEW_REQUIRED" if needs_human
+                else "NEEDS_REVISION" if is_complete
+                else "INCOMPLETE"
+            )
+            if not is_written and ch.get("lifecycle_status") == "GENERATING":
+                lifecycle = "GENERATING"
 
             chapter_details.append({
                 "chapter": number,
@@ -287,6 +348,20 @@ class ManuscriptService:
                 "validation_status": validation_status or "PENDING",
                 "citations": citations,
                 "citation_ok": chapter_citation_ok,
+                "lifecycle_status": lifecycle,
+                "gate_failures": gate_failures,
+                "claim_gate": {
+                    "ok": not any("unsupported numerical" in f or "critical claim" in f for f in gate_failures),
+                    "summary": cls._json_field(audit, "claim_summary_json"),
+                },
+                "repetition_gate": {
+                    "ok": not any("repetition" in f for f in gate_failures),
+                    "summary": cls._json_field(audit, "repetition_summary_json"),
+                },
+                "architecture_gate": {
+                    "ok": not any("purpose overlaps" in f for f in gate_failures),
+                    "summary": cls._json_field(audit, "architecture_summary_json"),
+                },
             })
 
         # Required chapters that the outline does not contain at all.
@@ -356,6 +431,17 @@ class ManuscriptService:
                 "Chapters requiring human review before publication: "
                 + ", ".join(str(n) for n in sorted(human_review_chapters)) + "."
             )
+        for detail in chapter_details:
+            if detail.get("gate_failures"):
+                blocking.append(
+                    f"Chapter {detail['chapter']} is blocked by the publication quality gate: "
+                    + "; ".join(detail["gate_failures"]) + "."
+                )
+        if gate_blocked_chapters:
+            blocking.append(
+                "Quality-gate blocked chapters: "
+                + ", ".join(str(n) for n in sorted(set(gate_blocked_chapters))) + "."
+            )
         if unapproved and not human_review_chapters:
             blocking.append(
                 "Chapters without a verified PASS audit (re-run the independent auditor): "
@@ -385,10 +471,22 @@ class ManuscriptService:
             "publication_ready_chapters": len(publication_ready_chapters),
         }
 
+        if status == STATUS_READY:
+            lifecycle_status = "PUBLICATION_READY"
+        elif any(d["lifecycle_status"] == "GENERATING" for d in chapter_details):
+            lifecycle_status = "GENERATING"
+        elif all_complete and (human_review_chapters or gate_blocked_chapters):
+            lifecycle_status = "HUMAN_REVIEW_REQUIRED"
+        elif all_complete:
+            lifecycle_status = "NEEDS_REVISION"
+        else:
+            lifecycle_status = "INCOMPLETE"
+
         return {
             "status": status,
             "label": label,
             "can_publish": status == STATUS_READY,
+            "lifecycle_status": lifecycle_status,
             "project_id": project_id,
             # Canonical counts
             "required_chapters": required,
@@ -402,6 +500,8 @@ class ManuscriptService:
             "audit_approved_chapters": sorted(approved_chapters),
             "human_review_required_count": len(human_review_chapters),
             "human_review_required_chapters": sorted(human_review_chapters),
+            "gate_blocked_count": len(set(gate_blocked_chapters)),
+            "gate_blocked_chapters": sorted(set(gate_blocked_chapters)),
             "publication_ready_count": len(publication_ready_chapters),
             "publication_ready_chapters": sorted(publication_ready_chapters),
             "counts": counts,

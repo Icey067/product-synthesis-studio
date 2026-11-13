@@ -4,6 +4,7 @@ from database.db import get_connection, transaction
 from services.ollama_client import OllamaClient
 from services.product_format_service import contract_text, validate_transformation_map
 from services.generation_utils import generate_with_validation
+from services.target_integrity_service import TargetIntegrityService
 from config.prompts import PROMPT_TRANSFORMATION_MAP
 from models.schemas import TransformationMap
 
@@ -77,6 +78,13 @@ class TransformationService:
                 "INSERT INTO activity_logs (project_id, action, details) VALUES (?, ?, ?)",
                 (project_id, "TRANSFORMATION_MAP_SAVED", f"Generated {product_format} transformation map"),
             )
+        # Measurable results are planning targets, not automatically proven
+        # outcomes.  Persist their category and a visible qualification.
+        targets = TargetIntegrityService.save(
+            project_id,
+            (data.get("after_situation") or {}).get("measurable_results") or [],
+        )
+        data["transformation_targets"] = targets
         return True, data, "Transformation Map generated successfully."
 
     @staticmethod
@@ -86,13 +94,15 @@ class TransformationService:
             cur.execute("SELECT * FROM transformation_maps WHERE project_id = ?", (project_id,))
             row = cur.fetchone()
             if row:
-                return {
+                result = {
                     "before_situation": json.loads(row["before_json"]),
                     "after_situation": json.loads(row["after_json"]),
                     "milestones": json.loads(row["milestones_json"]),
                     "product_format": row["product_format"] if "product_format" in row.keys() else "Ebook",
                     "updated_at": row["updated_at"],
                 }
+                result["transformation_targets"] = TargetIntegrityService.list(project_id)
+                return result
         return None
 
     @staticmethod
@@ -116,4 +126,10 @@ class TransformationService:
                     json.dumps(map_data.get("milestones", [])),
                 ),
             )
-            return True
+        TargetIntegrityService.save(
+            project_id,
+            map_data.get("transformation_targets")
+            or (map_data.get("after_situation") or {}).get("measurable_results")
+            or [],
+        )
+        return True

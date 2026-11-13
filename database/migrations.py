@@ -230,6 +230,8 @@ def _migration_005_project_manuscript_settings(conn: sqlite3.Connection) -> None
 
     target_default = int(DEFAULT_CHAPTER_TARGET_WORDS)
     min_default = int(DEFAULT_MIN_CHAPTER_WORDS)
+    if not _table_exists(conn, "projects"):
+        return
     if _table_exists(conn, "application_settings"):
         for key, fallback in (
             ("chapter_target_words", target_default),
@@ -461,6 +463,196 @@ def _migration_006_p2_intelligence(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migration_007_publication_quality(conn: sqlite3.Connection) -> None:
+    """P2.2 publication-quality engine.
+
+    Adds structured claim records, cross-chapter repetition records, a persisted
+    book architecture/coverage matrix, section-level validation state and audit
+    columns.  Everything is additive so existing projects keep working.
+    """
+    # Chapter / section / plan lifecycle and validation state.
+    _add_column(conn, "chapters", "lifecycle_status", "TEXT DEFAULT 'INCOMPLETE'")
+    _add_column(conn, "chapter_plans", "architecture_json", "TEXT")
+    _add_column(conn, "chapter_plans", "evidence_plan_json", "TEXT")
+    _add_column(conn, "chapter_sections", "validation_json", "TEXT")
+    _add_column(conn, "chapter_sections", "validation_status", "TEXT DEFAULT 'PENDING'")
+    _add_column(conn, "chapter_sections", "claim_summary_json", "TEXT")
+    _add_column(conn, "chapter_sections", "repetition_summary_json", "TEXT")
+    _add_column(conn, "chapter_sections", "revision", "INTEGER DEFAULT 0")
+    _add_column(conn, "chapter_sections", "approved", "INTEGER DEFAULT 0")
+    _add_column(conn, "quality_reports", "claim_summary_json", "TEXT")
+    _add_column(conn, "quality_reports", "repetition_summary_json", "TEXT")
+    _add_column(conn, "quality_reports", "architecture_summary_json", "TEXT")
+    _add_column(conn, "quality_reports", "gate_status", "TEXT")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chapter_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            chapter_id INTEGER NOT NULL,
+            section_id INTEGER,
+            section_key TEXT,
+            claim_key TEXT NOT NULL,
+            claim_text TEXT NOT NULL,
+            claim_type TEXT NOT NULL,
+            citation_ids_json TEXT,
+            source_ids_json TEXT,
+            excerpts_json TEXT,
+            verification_status TEXT NOT NULL DEFAULT 'UNVERIFIED',
+            confidence REAL DEFAULT 0.0,
+            human_review_status TEXT DEFAULT 'NOT_REQUIRED',
+            review_note TEXT,
+            severity TEXT DEFAULT 'MEDIUM',
+            number_check_json TEXT,
+            unit_check_json TEXT,
+            population_check_json TEXT,
+            geography_check_json TEXT,
+            time_check_json TEXT,
+            meaning_check_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+            FOREIGN KEY(section_id) REFERENCES chapter_sections(id) ON DELETE SET NULL,
+            UNIQUE(chapter_id, claim_key)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chapter_claims_chapter ON chapter_claims(chapter_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chapter_claims_project ON chapter_claims(project_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chapter_claims_status ON chapter_claims(verification_status)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS claim_verification_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            claim_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            previous_status TEXT,
+            verification_status TEXT NOT NULL,
+            human_review_status TEXT NOT NULL,
+            explanation TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(claim_id) REFERENCES chapter_claims(id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_claim_verification_events_claim "
+        "ON claim_verification_events(claim_id)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS repetition_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            chapter_id INTEGER,
+            scope TEXT NOT NULL DEFAULT 'PROJECT',
+            similarity_threshold REAL DEFAULT 0.82,
+            exact_count INTEGER DEFAULT 0,
+            near_count INTEGER DEFAULT 0,
+            finding_count INTEGER DEFAULT 0,
+            critical_count INTEGER DEFAULT 0,
+            summary_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_repetition_runs_project ON repetition_runs(project_id)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS repetition_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            chapter_id INTEGER,
+            original_chapter_id INTEGER,
+            original_chapter_number INTEGER,
+            duplicate_chapter_number INTEGER,
+            original_section TEXT,
+            duplicate_section TEXT,
+            match_type TEXT NOT NULL,
+            similarity REAL DEFAULT 0.0,
+            original_text TEXT NOT NULL,
+            duplicate_text TEXT NOT NULL,
+            recommendation TEXT,
+            severity TEXT DEFAULT 'MEDIUM',
+            resolved INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(run_id) REFERENCES repetition_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE SET NULL,
+            FOREIGN KEY(original_chapter_id) REFERENCES chapters(id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_repetition_findings_run ON repetition_findings(run_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_repetition_findings_chapter "
+        "ON repetition_findings(chapter_id)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS book_architectures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL UNIQUE,
+            architecture_json TEXT NOT NULL,
+            coverage_matrix_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PLANNED',
+            overlap_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    # --- Measurable transformation targets ---------------------------
+    # These remain separate from factual claims.  A reader-selected target is
+    # useful, but must never silently become a guaranteed product outcome.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS transformation_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            target_text TEXT NOT NULL,
+            target_value TEXT,
+            metric TEXT,
+            measurement_method TEXT,
+            population TEXT,
+            time_period TEXT,
+            target_category TEXT NOT NULL,
+            source_ids_json TEXT DEFAULT '[]',
+            evidence_status TEXT NOT NULL DEFAULT 'NOT_INDEPENDENTLY_ESTABLISHED',
+            display_label TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transformation_targets_project "
+        "ON transformation_targets(project_id)"
+    )
+
+
 MIGRATIONS: List[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "evidence_linking", _migration_001_evidence_linking),
     (2, "generation_contracts", _migration_002_generation_contracts),
@@ -468,6 +660,7 @@ MIGRATIONS: List[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (4, "p1_trust_backup_autosave", _migration_004_p1_trust_backup_autosave),
     (5, "project_manuscript_settings", _migration_005_project_manuscript_settings),
     (6, "p2_intelligence", _migration_006_p2_intelligence),
+    (7, "publication_quality", _migration_007_publication_quality),
 ]
 
 

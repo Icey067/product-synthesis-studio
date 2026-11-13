@@ -5,6 +5,9 @@ from services.charter_service import CharterService
 from services.audit_service import AuditService
 from services.editorial_service import EditorialService
 from services.manuscript_service import ManuscriptService
+from services.claim_service import ClaimService
+from services.repetition_service import RepetitionService
+from services.book_architecture_service import BookArchitectureService
 
 def render_quality_auditor():
     st.markdown("## 🛡️ Independent Quality & Factual Auditor")
@@ -145,6 +148,64 @@ def render_quality_auditor():
             )
             if issue.get("claim"):
                 st.caption(f"Claim: {issue['claim'][:300]}")
+
+    st.markdown("##### 🔎 Claim Verification Report")
+    claims = ClaimService.list_claims(selected_chapter["id"])
+    if claims:
+        for claim in claims:
+            title = (
+                f"[{claim['severity']}] {claim['verification_status']} — "
+                f"{claim['claim_text'][:110]}"
+            )
+            with st.expander(title, expanded=False):
+                st.write(claim["claim_text"])
+                st.caption(
+                    f"Type: {claim['claim_type']} · Section: {claim.get('section_key') or 'body'} · "
+                    f"Human review: {claim['human_review_status']}"
+                )
+                for evidence in claim.get("excerpts") or []:
+                    st.markdown(
+                        f"**[Source-{evidence.get('source_id')}] {evidence.get('title') or 'Source'}**"
+                    )
+                    st.code(evidence.get("excerpt") or "No matching excerpt stored.")
+                st.caption(claim.get("review_note") or "No verification note recorded.")
+                if claim.get("human_review_status") in {"REQUIRED", "PENDING"}:
+                    h1, h2 = st.columns(2)
+                    if h1.button("Mark human-verified", key=f"claim_ok_{claim['id']}", use_container_width=True):
+                        ClaimService.set_human_review(
+                            claim["id"], "APPROVED", "Explicitly verified by a human reviewer in the Quality Auditor."
+                        )
+                        st.rerun()
+                    if h2.button("Reject claim", key=f"claim_reject_{claim['id']}", use_container_width=True):
+                        ClaimService.set_human_review(
+                            claim["id"], "REJECTED", "Rejected by a human reviewer in the Quality Auditor."
+                        )
+                        st.rerun()
+    else:
+        st.info("No persisted candidate claims yet. Run the audit to extract and verify claims.")
+
+    st.markdown("##### ♻️ Repetition and Chapter Coverage")
+    repetition = RepetitionService.chapter_summary(selected_chapter["id"])
+    if repetition.get("finding_count"):
+        for finding in repetition.get("findings", []):
+            st.warning(
+                f"{finding.get('match_label', finding.get('match_type'))} "
+                f"({finding.get('similarity', 0):.0%}): {finding.get('recommendation', '')}"
+            )
+            st.caption(f"Earlier: {finding.get('original_text', '')[:280]}")
+            st.caption(f"This chapter: {finding.get('duplicate_text', '')[:280]}")
+    else:
+        st.success("No repetition findings are attached to this chapter's latest manuscript scan.")
+    architecture = BookArchitectureService.get(project_id) or BookArchitectureService.build(project_id)
+    overlaps = [
+        item for item in architecture.get("overlaps", [])
+        if selected_chapter["chapter_number"] in {item.get("chapter"), item.get("overlaps_with")}
+    ]
+    if overlaps:
+        for overlap in overlaps:
+            st.warning(
+                f"Chapter-purpose overlap with chapter {overlap.get('overlaps_with')}: {overlap.get('reason')}"
+            )
 
     st.markdown("##### 📊 Editorial Rubric")
     rubric = report.get("editorial_rubric") or {}

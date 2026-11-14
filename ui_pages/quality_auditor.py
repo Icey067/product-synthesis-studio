@@ -35,21 +35,107 @@ def render_quality_auditor():
         f"""
         <div class="pss-card">
             <b>Canonical manuscript status:</b> {assessment['label']}<br/>
+            <b>Lifecycle:</b> {assessment.get('lifecycle_status', 'UNKNOWN')}<br/>
             <b>Required:</b> {counts['required_chapters']} |
             <b>Outlined:</b> {counts['existing_chapters']} |
             <b>Written:</b> {counts['written_chapters']} |
             <b>At minimum length:</b> {counts['min_word_compliant_chapters']} |
             <b>Audit-approved:</b> {counts['audit_approved_chapters']} |
             <b>Human review required:</b> {counts['human_review_required_chapters']} |
+            <b>Quality-gate blocked:</b> {counts.get('gate_blocked_chapters', 0)} |
             <b>Publication-ready:</b> {counts['publication_ready_chapters']}
         </div>
         """,
         unsafe_allow_html=True,
     )
+    if assessment.get("lifecycle_status") == "PUBLICATION_READY":
+        st.success("✅ Publication gate: every required chapter is approved and publication-ready.")
+    elif counts.get("gate_blocked_chapters"):
+        st.error(
+            "⛔ Publication gate is BLOCKED: one or more chapters failed a hard quality gate "
+            "(unsupported numerical claims, repetition threshold or chapter-purpose overlap)."
+        )
     if assessment["blocking_reasons"]:
         with st.expander("Publication blockers (canonical)", expanded=False):
             for reason in assessment["blocking_reasons"]:
                 st.markdown(f"• {reason}")
+
+    # Project-wide repetition scan and book architecture (P2.2).
+    with st.expander("♻️ Project repetition scan (cross-chapter)", expanded=False):
+        run = RepetitionService.latest_run(project_id)
+        if not run:
+            st.info(
+                "No repetition scan recorded yet. Run a quality audit or generate a chapter to "
+                "trigger a manuscript-wide scan."
+            )
+        else:
+            summary = run.get("summary") or {}
+            ok = bool(summary.get("gate_ok", True))
+            marker = "✅" if ok else "⛔"
+            st.markdown(
+                f"{marker} **Run #{run['id']}** — findings: {run.get('finding_count', 0)} "
+                f"(exact: {run.get('exact_count', 0)}, near: {run.get('near_count', 0)}, "
+                f"high severity: {run.get('critical_count', 0)}) · threshold "
+                f"{run.get('similarity_threshold', 0):.2f} · max per chapter "
+                f"{summary.get('max_per_chapter', '—')} · project limit {summary.get('max_project', '—')}"
+            )
+            by_chapter = summary.get("by_chapter") or {}
+            if by_chapter:
+                st.dataframe(
+                    [
+                        {"Chapter": ch, "Findings": count, "Over limit": "YES" if ch in (summary.get("offending_chapters") or []) else "no"}
+                        for ch, count in sorted(by_chapter.items())
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            findings = RepetitionService.list_findings(int(run["id"]))
+            if findings:
+                st.markdown("All findings (original vs duplicate, newest scan):")
+                for finding in findings:
+                    severity = str(finding.get("severity") or "MEDIUM").upper()
+                    prefix = "🟥" if severity == "HIGH" else "🟨"
+                    st.markdown(
+                        f"{prefix} **Ch{finding.get('original_chapter_number')} → Ch{finding.get('duplicate_chapter_number')} · "
+                        f"{finding.get('match_type')} · similarity {finding.get('similarity')}**"
+                    )
+                    st.markdown(f"**Recommendation:** {finding.get('recommendation', '')}")
+                    st.caption(f"Original (ch {finding.get('original_chapter_number')}): {finding.get('original_text', '')[:400]}")
+                    st.caption(f"Duplicate (ch {finding.get('duplicate_chapter_number')}): {finding.get('duplicate_text', '')[:400]}")
+            else:
+                st.success("No findings in the latest scan.")
+
+    with st.expander("🏛️ Book architecture & chapter coverage matrix", expanded=False):
+        architecture = BookArchitectureService.get(project_id) or BookArchitectureService.build(project_id)
+        status = architecture.get("status", "PLANNED")
+        overlap_count = int(architecture.get("overlap_count") or 0)
+        if status == "APPROVED_ARCHITECTURE":
+            st.success("Every chapter has a distinct purpose; no coverage overlaps detected.")
+        else:
+            st.warning(
+                f"Architecture status: {status} — {overlap_count} purpose overlap(s) to resolve "
+                "before chapters can be approved as unique."
+            )
+        matrix = architecture.get("coverage_matrix") or []
+        if matrix:
+            st.dataframe(
+                [
+                    {
+                        "Ch": row.get("chapter"),
+                        "Title": row.get("title"),
+                        "Unique purpose": (row.get("unique_purpose") or "")[:140],
+                        "Learning outcome": (row.get("learning_outcome") or "")[:100],
+                        "Unique?": "YES" if row.get("unique") else "OVERLAP",
+                        "Must not repeat": ", ".join((row.get("must_not_repeat") or [])[:4]),
+                    }
+                    for row in matrix
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.json(matrix)
+        else:
+            st.info("No coverage matrix available yet.")
 
     chap_options = [
         f"Chapter {c['chapter_number']}: {c['title']} ({c.get('word_count', 0)} words)"
@@ -92,6 +178,11 @@ def render_quality_auditor():
 
     badge_class = "pss-badge-high" if status == "PASS" else ("pss-badge-medium" if status == "NEEDS_IMPROVEMENT" else "pss-badge-low")
 
+    gate_status = str(report.get("gate_status") or "").upper()
+    gate_marker = {"PASS": "✅ Publication gate: PASS", "HUMAN_REVIEW": "🖐️ Publication gate: human review required"}.get(
+        gate_status, "⛔ Publication gate: BLOCKED" if gate_status == "BLOCKED" else ""
+    )
+
     st.markdown(
         f"""
         <div class="pss-card">
@@ -100,11 +191,18 @@ def render_quality_auditor():
                 <span class="pss-badge {badge_class}">{'REPORTED' if legacy_unverified else 'DETERMINISTIC'} SCORE: {score}/100</span>
             </div>
             <b>Summary:</b> {report.get('summary_verdict', '')}<br/>
-            <b>Human review required:</b> {'YES' if human_review else 'No'}
+            <b>Human review required:</b> {'YES' if human_review else 'No'}{('<br/><b>' + gate_marker + '</b>') if gate_marker else ''}
         </div>
         """,
         unsafe_allow_html=True,
     )
+    if gate_status == "BLOCKED":
+        st.error(
+            "⛔ This chapter is blocked by a hard publication gate. Gates cannot be overridden by "
+            "scores or by the model: unsupported numerical claims, invalid citation IDs, missing "
+            "evidence, repetition over threshold, structural failures and unresolved critical "
+            "defects all block publication."
+        )
     if human_review:
         st.error(
             "🖐️ This chapter **requires human verification** before it can be treated as publication-ready. "
@@ -126,6 +224,10 @@ def render_quality_auditor():
             "word_target": "Meets minimum word target",
             "format_compliant": "Matches selected product format",
             "statistics_supported": "All statistics supported by a source",
+            "claims_supported": "All factual claims supported by evidence",
+            "no_critical_unsupported_numeric": "No unsupported numerical claims",
+            "repetition_ok": "Repetition within configured thresholds",
+            "unique_purpose": "Chapter purpose is unique in the book",
             "no_repetition": "No repetitive passages",
         }
         cols = st.columns(2)
@@ -150,19 +252,75 @@ def render_quality_auditor():
                 st.caption(f"Claim: {issue['claim'][:300]}")
 
     st.markdown("##### 🔎 Claim Verification Report")
+    claim_summary = report.get("claim_summary") or {}
+    if claim_summary.get("total_claims"):
+        st.caption(
+            f"Extracted claims: {claim_summary.get('total_claims', 0)} · excerpt-matched: "
+            f"{claim_summary.get('excerpt_matched_count', 0)} · human-verified: "
+            f"{claim_summary.get('verified_claims', 0)}/{claim_summary.get('evidence_required_claims', 0)} "
+            f"evidence-required · unsupported: {claim_summary.get('unsupported_count', 0)} · "
+            f"partially supported: {claim_summary.get('partially_supported_count', 0)} · "
+            f"source-found only: {claim_summary.get('source_found_count', 0)} · "
+            f"human review: {claim_summary.get('human_review_count', 0)} · "
+            f"citation coverage: {claim_summary.get('citation_coverage', 0):.0%}"
+        )
     claims = ClaimService.list_claims(selected_chapter["id"])
     if claims:
         for claim in claims:
+            status = claim["verification_status"]
+            emoji = {
+                "VERIFIED": "✅", "EXCERPT_MATCHED": "🟩", "PARTIALLY_VERIFIED": "🟧",
+                "PARTIALLY_SUPPORTED": "🟧", "SOURCE_FOUND": "🟨", "UNSUPPORTED": "⛔",
+                "HUMAN_REVIEW": "🖐️", "HUMAN_REVIEW_REQUIRED": "🖐️", "HUMAN_VERIFIED": "🔐",
+                "QUALIFIED": "🏷️", "NOT_APPLICABLE": "ℹ️",
+            }.get(status, "❔")
             title = (
-                f"[{claim['severity']}] {claim['verification_status']} — "
-                f"{claim['claim_text'][:110]}"
+                f"{emoji} [{claim['severity']}] {status} — {claim['claim_text'][:110]}"
             )
             with st.expander(title, expanded=False):
                 st.write(claim["claim_text"])
                 st.caption(
                     f"Type: {claim['claim_type']} · Section: {claim.get('section_key') or 'body'} · "
-                    f"Human review: {claim['human_review_status']}"
+                    f"Human review: {claim['human_review_status']} · Confidence: {claim.get('confidence', 0):.2f}"
                 )
+                if claim.get("claim_type") == "NUMERICAL_STATISTIC":
+                    dims = [
+                        ("Number in source", claim.get("number_check") or {}),
+                        ("Unit match", claim.get("unit_check") or {}),
+                        ("Population", claim.get("population_check") or {}),
+                        ("Geography", claim.get("geography_check") or {}),
+                        ("Time period", claim.get("time_check") or {}),
+                        ("Meaning/context", claim.get("meaning_check") or {}),
+                    ]
+                    st.markdown("Dimension checks:")
+                    for label, check in dims:
+                        if not check:
+                            continue
+                        if label == "Meaning/context":
+                            present = check.get("present", False)
+                            st.markdown(f"- {'✅' if present else '🟧'} {label}: coverage {check.get('coverage', 0)} (threshold {check.get('threshold', 0)})")
+                        elif check.get("required"):
+                            missing = ", ".join(check.get("missing") or []) or "none"
+                            st.markdown(f"- {'✅' if check.get('present') else '🟧'} {label}: present" if check.get("present") else f"- 🟧 {label}: missing ({missing})")
+                        else:
+                            st.markdown(f"- ➖ {label}: not required")
+                prov = claim.get("provenance_check") or {}
+                if prov:
+                    st.markdown("Provenance check:")
+                    st.markdown(
+                        f"- {'✅' if prov.get('submission_supported', True) else '🟧'} Submission claim supported by source"
+                        + (f" — “{prov.get('submission_entity')}”" if prov.get("submission_entity") else "")
+                    )
+                    st.markdown(
+                        f"- {'✅' if not prov.get('missing_institutions') else '🟧'} Named institutions present in source"
+                        + (f" — missing: {', '.join(prov['missing_institutions'])}" if prov.get("missing_institutions") else "")
+                    )
+                    st.markdown(
+                        f"- {'🟧' if prov.get('causal_risk') else '✅'} Causation vs association wording"
+                    )
+                    st.markdown(
+                        f"- {'✅' if prov.get('quote_match') else '➖'} Verbatim quote match"
+                    )
                 for evidence in claim.get("excerpts") or []:
                     st.markdown(
                         f"**[Source-{evidence.get('source_id')}] {evidence.get('title') or 'Source'}**"

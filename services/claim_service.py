@@ -61,6 +61,13 @@ VERIFICATION_STATUSES = {
     "QUALIFIED",
     "NOT_APPLICABLE",
     "UNVERIFIED",
+    # P2.3.4 strict evidence pipeline.  Lexical overlap alone can never
+    # certify a claim: the deterministic ceiling is EXCERPT_MATCHED, and only
+    # a recorded human decision can promote a claim to HUMAN_VERIFIED.
+    "SOURCE_FOUND",
+    "EXCERPT_MATCHED",
+    "PARTIALLY_SUPPORTED",
+    "HUMAN_REVIEW_REQUIRED",
 }
 
 HUMAN_REVIEW_STATUSES = {"NOT_REQUIRED", "REQUIRED", "PENDING", "APPROVED", "REJECTED"}
@@ -173,6 +180,31 @@ _EXAMPLE = re.compile(
     r"say you|let's say|as an illustration|illustrative example)\b",
     re.IGNORECASE,
 )
+# Sample copy the model writes inside examples (a caption, a promo message, a
+# template).  A quoted snippet containing a figure is illustrative, not a
+# research statistic.
+_QUOTED_SAMPLE = re.compile(r'"[^"]{0,240}\d[^"]{0,240}"')
+# Reader-facing targets/instructions ("Resolve at least 80% ... within 24
+# hours") are guidance for the reader, not externally verifiable statistics.
+_TARGET_INSTRUCTION = re.compile(
+    r"\b(at least|no more than|up to|within \d+\s?(?:hours|days|weeks|months)|"
+    r"e\.g\.|i\.e\.|aim for|try to)\b",
+    re.IGNORECASE,
+)
+_IMPERATIVE_START = re.compile(
+    r"^(?:resolve|set|get|use|monitor|compare|ensure|add|create|reply|respond|"
+    r"avoid|keep|make|choose|write|schedule|review|track|share|post|ask|check|"
+    r"verify|complete|prepare|list|call|send|aim|achieve|reach|maintain|"
+    r"include|greet|welcome|offer|announce|provide|record|note|mark|assign|"
+    r"pick|select|follow|start|begin|run|conduct|measure|reduce|increase|"
+    r"improve|automate|enable|disable|update|publish|build|apply|do)\b",
+    re.IGNORECASE,
+)
+# Promo/sample copy such as "Get 10% off on your next purchase."
+_PROMO_COPY = re.compile(
+    r"\b(?:enjoy|get|save|flat|grab)\s+\d+(?:\.\d+)?\s?%|%\s?off\b",
+    re.IGNORECASE,
+)
 _ASPIRATION = re.compile(
     r"\b(target|targets|goal|goals|aim|aims|aspire|aspiration|objective|"
     r"intend|intends|intention|plan to|want to|hope to|expect to reach|"
@@ -222,14 +254,23 @@ _EXTERNAL_VERIFIABLE = re.compile(
     re.IGNORECASE,
 )
 
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?!\[)|\n+")
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?!\[)|(?<=\])\s+|\n+")
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*\S)\s*$")
 _LIST_MARKER = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
 MIN_CLAIM_WORDS = 7
 EXCERPT_CHARS = 700
+# Relevance floor: below this the cited excerpt is not even topically related.
 MEANING_MIN_COVERAGE = 0.18
 MEANING_MIN_TOKENS = 2
+# Strict pipeline (P2.3.4).  A verdict may never rest on lexical overlap
+# alone, so overlap only classifies *how far* the evidence reaches:
+#   >= 0.60 -> EXCERPT_MATCHED (pending human confirmation)
+#   >= 0.30 -> PARTIALLY_SUPPORTED
+#   >= 0.18 -> SOURCE_FOUND (source exists, excerpt is only topically related)
+#   <  0.18 -> SOURCE_FOUND with an explicit "excerpt does not support" note
+EXCERPT_MATCH_MIN_COVERAGE = 0.60
+PARTIAL_MATCH_MIN_COVERAGE = 0.30
 
 
 # ---------------------------------------------------------------------------
@@ -355,9 +396,20 @@ def _best_excerpt(source_text: str, claim_text: str, numbers: List[Dict[str, Any
             "all_units_match": bool(claim_numbers) and all(m["unit_family_match"] for m in matched),
         }
 
-    start = max(0, best_index - 1)
-    end = min(len(sentences), best_index + 2)
-    excerpt = " ".join(sentences[start:end]).strip()
+    # Anchor the excerpt on the best-matching sentence first, then extend the
+    # window with adjacent sentences while the character budget lasts.  A hard
+    # left-truncation must never cut the matched sentence out of the excerpt.
+    best_text = sentences[best_index]
+    budget = max(EXCERPT_CHARS, len(best_text) + 1)
+    excerpt = best_text
+    after = best_index + 1
+    while after < len(sentences) and len(excerpt) + 1 + len(sentences[after]) <= budget:
+        excerpt = excerpt + " " + sentences[after]
+        after += 1
+    before = best_index - 1
+    while before >= 0 and len(sentences[before]) + 1 + len(excerpt) <= budget:
+        excerpt = sentences[before] + " " + excerpt
+        before -= 1
     if len(excerpt) > EXCERPT_CHARS:
         excerpt = excerpt[:EXCERPT_CHARS].rsplit(" ", 1)[0] + "…"
     excerpt_numbers = _numbers(excerpt)
@@ -391,10 +443,122 @@ def _source_reliability(source: Dict[str, Any]) -> float:
     return RELIABILITY_RANK.get(str(value).upper(), 0.35)
 
 
+# ---------------------------------------------------------------------------
+# Provenance, attribution and causal-wording checks (P2.3.4)
+# ---------------------------------------------------------------------------
+_NAMED_INSTITUTIONS: List[Tuple[str, str]] = [
+    (r"\breserve bank of india\b|\brbi\b", "Reserve Bank of India"),
+    (r"\bnpci\b|national payments? corporation", "NPCI"),
+    (r"\bgoogle\b", "Google"),
+    (r"\bsebi\b", "SEBI"),
+    (r"\btrai\b", "TRAI"),
+    (r"\bministry of [a-z ]{3,40}", "Ministry"),
+    (r"\bgovernment of india\b", "Government of India"),
+    (r"\bworld health organization\b|\bwho\b", "WHO"),
+    (r"\bworld bank\b", "World Bank"),
+    (r"\bniti aayog\b", "NITI Aayog"),
+    (r"\bims?\b|international monetary fund", "IMF"),
+    (r"\bunesco\b", "UNESCO"),
+    (r"\bnpci\b", "NPCI"),
+]
+_SUBMISSION_PHRASE = re.compile(
+    r"\b(?:submitted|presented|filed|sent|lodged|delivered)\s+(?:to|with|before)\s+"
+    r"(?:the\s+)?(?P<entity>[A-Z][A-Za-z]*(?:\s+(?:of|for|and)?\s*[A-Z][A-Za-z]*){0,6})",
+)
+_CAUSAL_PHRASE = re.compile(
+    r"\b(?:causes?|caused by|causing|leads? to|led to|results? in|resulted in|"
+    r"because of|due to|drives?|proves? that)\b",
+    re.IGNORECASE,
+)
+_CORRELATION_HINT = re.compile(
+    r"\b(?:associated with|correlat|linked to|tends? to|suggests?|"
+    r"perceived|perception|survey|respondents? (?:said|reported|stated))\b",
+    re.IGNORECASE,
+)
+
+
+def _haystack_for(source: Dict[str, Any], excerpt: str) -> str:
+    parts = [
+        source.get("title") or "",
+        source.get("publisher") or "",
+        source.get("url") or "",
+        excerpt or "",
+        (source.get("raw_content") or "")[:4000],
+    ]
+    return " ".join(str(p) for p in parts)
+
+
+def provenance_check(
+    claim_text: str,
+    evidence: List[Dict[str, Any]],
+    sources: Dict[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Deterministic provenance screen.
+
+    Catches (a) claims that name an institution the cited source never
+    mentions, (b) "submitted/presented to X" phrasing that the source does not
+    support, and (c) causal wording applied to sources that only report
+    association or perception.  None of these decide the verdict alone; they
+    force human review when they fail.
+    """
+    text = claim_text or ""
+    named: List[str] = []
+    for pattern, label in _NAMED_INSTITUTIONS:
+        if re.search(pattern, text, re.IGNORECASE) and label not in named:
+            named.append(label)
+    submission = _SUBMISSION_PHRASE.search(text)
+    submission_entity = (submission.group("entity").strip() if submission else "")
+    causal_claim = bool(_CAUSAL_PHRASE.search(text))
+
+    combined = " ".join(
+        _haystack_for(sources.get(int(e.get("source_id") or 0), {}), e.get("excerpt", ""))
+        for e in evidence
+    )
+    combined_lower = combined.lower()
+    missing = [
+        label for label in named
+        if label.lower() not in combined_lower
+    ]
+    submission_supported = True
+    if submission_entity:
+        # The named recipient must appear in the source text or metadata.
+        submission_supported = submission_entity.lower() in combined_lower
+
+    causal_risk = False
+    if causal_claim and evidence:
+        excerpts = " ".join(e.get("excerpt", "") for e in evidence)
+        causal_risk = not _CAUSAL_PHRASE.search(excerpts) and bool(_CORRELATION_HINT.search(excerpts))
+
+    quote_match = False
+    if evidence:
+        bare = re.sub(r"\[(?:Source|Ref)-\d+\]", "", text, flags=re.IGNORECASE)
+        bare = re.sub(r"\s+", " ", bare).strip(" *#").lower()
+        for e in evidence:
+            excerpt_norm = re.sub(r"\s+", " ", e.get("excerpt", "")).lower()
+            if bare and bare in excerpt_norm:
+                quote_match = True
+                break
+
+    return {
+        "named_institutions": named,
+        "missing_institutions": missing,
+        "submission_entity": submission_entity,
+        "submission_supported": submission_supported,
+        "causal_wording": causal_claim,
+        "causal_risk": causal_risk,
+        "quote_match": quote_match,
+    }
+
+
+
 def _classify(text: str, numbers: List[Dict[str, Any]], cited: bool) -> str:
     if _ASPIRATION.search(text):
         return "USER_ASPIRATION"
     if numbers:
+        if _EXAMPLE.search(text) or _QUOTED_SAMPLE.search(text) or _PROMO_COPY.search(text):
+            return "ILLUSTRATIVE_EXAMPLE"
+        if _TARGET_INSTRUCTION.search(text) and _IMPERATIVE_START.match(text.strip()):
+            return "RECOMMENDATION"
         return "NUMERICAL_STATISTIC"
     if _EXAMPLE.search(text):
         return "ILLUSTRATIVE_EXAMPLE"
@@ -413,6 +577,24 @@ def _classify(text: str, numbers: List[Dict[str, Any]], cited: bool) -> str:
     if _FACTUAL.search(text) or cited:
         return "GENERAL_FACT"
     return "GENERAL_FACT"
+
+
+def _refine_type(claim_text: str, claim_type: str) -> str:
+    """Never record clearly illustrative/aspirational prose as a statistic.
+
+    Callers may pass a provisional type; quoted sample copy, promo snippets and
+    reader-facing target instructions are relabelled before verification so a
+    worksheet figure is never treated as a fabricated research statistic.
+    """
+    if claim_type != "NUMERICAL_STATISTIC":
+        return claim_type
+    if _ASPIRATION.search(claim_text or ""):
+        return "USER_ASPIRATION"
+    if _EXAMPLE.search(claim_text) or _QUOTED_SAMPLE.search(claim_text) or _PROMO_COPY.search(claim_text):
+        return "ILLUSTRATIVE_EXAMPLE"
+    if _TARGET_INSTRUCTION.search(claim_text) and _IMPERATIVE_START.match((claim_text or "").strip()):
+        return "RECOMMENDATION"
+    return claim_type
 
 
 def _is_candidate(text: str, numbers: List[Dict[str, Any]], cited: bool, claim_type: str) -> bool:
@@ -483,10 +665,9 @@ class ClaimService:
         cited_ids: List[int],
         sources: Dict[int, Dict[str, Any]],
     ) -> Dict[str, Any]:
-        # A caller may pass a provisional type, but an aspirational promise must
-        # never be recorded as an externally verifiable statistic.
-        if claim_type in EVIDENCE_REQUIRED_TYPES and _ASPIRATION.search(claim_text or ""):
-            claim_type = "USER_ASPIRATION"
+        # A caller may pass a provisional type, but an aspirational promise or
+        # sample/example copy must never be recorded as an external statistic.
+        claim_type = _refine_type(claim_text, claim_type)
         numbers = _numbers(claim_text)
         population = _extract_dimension(claim_text, _POPULATION_TERMS)
         geography = _extract_dimension(claim_text, _GEOGRAPHY_TERMS)
@@ -552,6 +733,8 @@ class ClaimService:
             "present": best_coverage >= MEANING_MIN_COVERAGE,
         }
 
+        provenance = provenance_check(claim_text, evidence, sources)
+
         status, confidence, severity, human, note = cls._decide(
             claim_type=claim_type,
             claim_text=claim_text,
@@ -564,6 +747,7 @@ class ClaimService:
             geography_check=geography_check,
             time_check=time_check,
             meaning_check=meaning_check,
+            provenance=provenance,
         )
 
         return {
@@ -583,6 +767,7 @@ class ClaimService:
             "geography_check": geography_check,
             "time_check": time_check,
             "meaning_check": meaning_check,
+            "provenance_check": provenance,
         }
 
     @classmethod
@@ -599,7 +784,18 @@ class ClaimService:
         geography_check: Dict[str, Any],
         time_check: Dict[str, Any],
         meaning_check: Dict[str, Any],
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, float, str, str, str]:
+        """Strict evidence-pipeline verdict (P2.3.4).
+
+        Lexical overlap is never treated as factual entailment.  The strongest
+        deterministic outcome is ``EXCERPT_MATCHED`` — the excerpt reproduces
+        the claim's key content (numbers, units, context) — which still stores
+        ``human_review_status = REQUIRED`` so only a recorded human decision
+        can promote it to ``HUMAN_VERIFIED``.
+        """
+        provenance = provenance or {}
+
         # Non-factual claim kinds: no external citation is required, but an
         # aspirational number must never be presented as a promise.
         if claim_type in {"RECOMMENDATION", "HYPOTHESIS", "ILLUSTRATIVE_EXAMPLE", "USER_ASPIRATION"}:
@@ -645,97 +841,170 @@ class ClaimService:
                 "Factual claim has no usable citation. Add a source that supports it or rewrite it as general explanatory material.",
             )
 
+        def _provenance_note(parts: List[str]) -> Optional[str]:
+            if not parts:
+                return None
+            return "Provenance risk: " + "; ".join(parts) + ". A human must check the cited source directly."
+
+        provenance_parts: List[str] = []
+        if provenance.get("missing_institutions"):
+            provenance_parts.append(
+                "claim names " + ", ".join(provenance["missing_institutions"])
+                + " but the cited source never mentions them"
+            )
+        if provenance.get("submission_entity") and not provenance.get("submission_supported"):
+            provenance_parts.append(
+                f"claim says material was submitted/presented to "
+                f"'{provenance['submission_entity']}' but the source does not document that submission"
+            )
+        if provenance.get("causal_risk"):
+            provenance_parts.append(
+                "claim states causation while the cited passage only reports association/perception"
+            )
+        provenance_blocker = _provenance_note(provenance_parts)
+
         reliability = sum(e.get("reliability_score", 0.0) for e in evidence) / len(evidence)
-        base = 0.15 + 0.25 * reliability
+        coverage = float(meaning_check.get("coverage") or 0.0)
+
+        # A provenance failure (false attribution, unsupported submission,
+        # causal wording on correlational evidence) always escalates to human
+        # review, whatever the overlap level is.
+        if provenance_blocker:
+            if not numbers or number_check["all_present"]:
+                return (
+                    "HUMAN_REVIEW_REQUIRED",
+                    0.45,
+                    "HIGH",
+                    "REQUIRED",
+                    "Support level: "
+                    + ("excerpt matched" if coverage >= EXCERPT_MATCH_MIN_COVERAGE else
+                       "partial" if coverage >= PARTIAL_MATCH_MIN_COVERAGE else "source found only")
+                    + f" (coverage {coverage:.2f}). " + provenance_blocker,
+                )
 
         if not numbers:
-            coverage_ok = meaning_check["present"]
-            if coverage_ok and reliability >= 0.6:
-                confidence = 0.55 + 0.25 * reliability + min(0.15, meaning_check["coverage"])
+            # Non-numeric factual claim: overlap only grades evidence reach.
+            if coverage >= EXCERPT_MATCH_MIN_COVERAGE:
+                if provenance_blocker:
+                    return (
+                        "HUMAN_REVIEW_REQUIRED",
+                        0.5,
+                        "MEDIUM",
+                        "REQUIRED",
+                        "Excerpt shares the claim's meaning, but " + provenance_blocker,
+                    )
                 return (
-                    "VERIFIED",
-                    confidence,
+                    "EXCERPT_MATCHED",
+                    min(0.9, 0.55 + 0.25 * reliability + coverage * 0.1),
                     "LOW",
-                    "NOT_REQUIRED",
-                    "Cited excerpt has meaningful lexical overlap with the claim and the source is assessed as credible.",
-                )
-            if coverage_ok:
-                return (
-                    "HUMAN_REVIEW",
-                    min(0.6, 0.35 + 0.2 * reliability),
-                    "MEDIUM",
                     "REQUIRED",
-                    "Cited excerpt is topically related but the source is not assessed as credible enough to certify the claim.",
+                    "Cited excerpt reproduces the claim's meaning (coverage "
+                    f"{coverage:.2f}). Pending human confirmation; not yet HUMAN_VERIFIED.",
                 )
-            return (
-                "PARTIALLY_VERIFIED",
-                min(0.45, base + meaning_check["coverage"]),
-                "MEDIUM",
-                "REQUIRED",
-                "The citation exists but its excerpt does not support the meaning of this claim. Verify manually or cite a more specific passage.",
+            if coverage >= PARTIAL_MATCH_MIN_COVERAGE:
+                note = (
+                    "Cited excerpt only partially matches the claim (coverage "
+                    f"{coverage:.2f}). Verify manually, narrow the claim, or cite a more specific passage."
+                )
+                if provenance_blocker:
+                    note = provenance_blocker + " " + note
+                return ("PARTIALLY_SUPPORTED", 0.45, "MEDIUM", "REQUIRED", note)
+            note = (
+                "Citation exists but the excerpt does not support the claim "
+                f"(coverage {coverage:.2f}). Rewrite, qualify, or cite a directly relevant passage."
             )
+            if provenance_blocker:
+                note = provenance_blocker + " " + note
+            return ("SOURCE_FOUND", 0.3, "MEDIUM", "REQUIRED", note)
 
         # Numerical claim.
         if not number_check["any_present"]:
+            note = "The cited source does not contain the stated number. Remove or correct the figure; do not substitute another invented number."
+            if provenance_blocker:
+                note = provenance_blocker + " " + note
             return (
                 "UNSUPPORTED",
                 0.0,
                 "CRITICAL",
                 "REQUIRED",
-                "The cited source does not contain the stated number. Remove or correct the figure; do not substitute another invented number.",
+                note,
             )
         if not number_check["all_present"]:
+            note = "Only some of the stated numbers appear in the cited source. Verify every figure and remove the ones that are unsupported."
+            if provenance_blocker:
+                note = provenance_blocker + " " + note
             return (
-                "PARTIALLY_VERIFIED",
+                "PARTIALLY_SUPPORTED",
                 0.2,
                 "HIGH",
                 "REQUIRED",
-                "Only some of the stated numbers appear in the cited source. Verify every figure and remove the ones that are unsupported.",
+                note,
             )
         if not unit_check["all_match"]:
+            note = "The number appears with a different unit in the source (for example a count versus a percentage). Correct the unit or remove the figure."
+            if provenance_blocker:
+                note = provenance_blocker + " " + note
             return (
-                "PARTIALLY_VERIFIED",
+                "PARTIALLY_SUPPORTED",
                 0.3,
                 "HIGH",
                 "REQUIRED",
-                "The number appears with a different unit in the source (for example a count versus a percentage). Correct the unit or remove the figure.",
+                note,
             )
 
-        confidence = base + 0.2
-        notes: List[str] = []
+        missing_dims: List[str] = []
         if not population_check["present"]:
-            notes.append("population")
+            missing_dims.append("population")
         if not geography_check["present"]:
-            notes.append("geography")
+            missing_dims.append("geography")
         if not time_check["present"]:
-            notes.append("time period")
-        if not meaning_check["present"]:
-            notes.append("meaning/context")
-        if notes:
+            missing_dims.append("time period")
+        if coverage < PARTIAL_MATCH_MIN_COVERAGE:
+            missing_dims.append("meaning/context")
+
+        if missing_dims:
+            note = (
+                "The number appears in the source, but the source does not verify: "
+                + ", ".join(missing_dims)
+                + ". Verify manually or remove the unsupported context."
+            )
+            if provenance_blocker:
+                note = provenance_blocker + " " + note
             return (
-                "PARTIALLY_VERIFIED",
-                min(0.55, confidence + meaning_check["coverage"]),
+                "PARTIALLY_SUPPORTED",
+                0.35,
                 "HIGH",
                 "REQUIRED",
-                "The number and unit appear in the source, but the source does not verify: "
-                + ", ".join(notes)
-                + ". Verify manually or remove the unsupported context.",
+                note,
             )
+
+        if provenance_blocker:
+            return (
+                "HUMAN_REVIEW_REQUIRED",
+                0.5,
+                "MEDIUM",
+                "REQUIRED",
+                "Number, unit and context all appear in the cited excerpt, but " + provenance_blocker,
+            )
+
         if reliability < 0.6:
             return (
-                "HUMAN_REVIEW",
-                min(0.7, confidence),
+                "HUMAN_REVIEW_REQUIRED",
+                min(0.7, 0.35 + 0.25 * reliability),
                 "MEDIUM",
                 "REQUIRED",
                 "The number is present and contextualised, but the source is not assessed as credible enough to certify publication.",
             )
-        confidence = min(0.98, confidence + 0.25 + meaning_check["coverage"])
+
+        confidence = min(0.9, 0.45 + 0.25 * reliability + coverage * 0.2)
         return (
-            "VERIFIED",
+            "EXCERPT_MATCHED",
             confidence,
             "LOW",
-            "NOT_REQUIRED",
-            "Number, unit, population, geography, time period and meaning are all supported by the cited excerpt.",
+            "REQUIRED",
+            "Cited excerpt contains the number, unit, population, geography, time period and meaning "
+            f"(coverage {coverage:.2f}). Pending human confirmation; a recorded human decision is required "
+            "before this claim may be presented as verified.",
         )
 
     # ------------------------------------------------------------------
@@ -790,20 +1059,33 @@ class ClaimService:
         critical = [c for c in claims if str(c.get("severity")).upper() == "CRITICAL"]
         human = [c for c in claims if c.get("human_review_status") in {"REQUIRED", "PENDING"}]
         required = [c for c in claims if c["claim_type"] in EVIDENCE_REQUIRED_TYPES]
-        verified_required = [
+        human_verified = [
             c for c in required
-            if c["verification_status"] in {"VERIFIED", "HUMAN_VERIFIED"}
+            if c["verification_status"] in {"HUMAN_VERIFIED"}
         ]
+        excerpt_matched = [
+            c for c in required
+            if c["verification_status"] in {"EXCERPT_MATCHED"}
+        ]
+
+        def _count(statuses: set[str]) -> int:
+            return sum(1 for c in claims if c["verification_status"] in statuses)
+
         return {
             "total_claims": len(claims),
             "by_type": by_type,
             "by_status": by_status,
             "evidence_required_claims": len(required),
-            "verified_claims": len(verified_required),
-            "citation_coverage": round(len(verified_required) / len(required), 3) if required else 1.0,
+            # Only a recorded human decision produces a "verified" claim.
+            "verified_claims": len(human_verified),
+            "excerpt_matched_count": len(excerpt_matched),
+            "partially_supported_count": _count({"PARTIALLY_SUPPORTED"}),
+            "source_found_count": _count({"SOURCE_FOUND"}),
+            "human_review_required_count": _count({"HUMAN_REVIEW_REQUIRED"}),
+            "citation_coverage": round(len(human_verified) / len(required), 3) if required else 1.0,
             "unsupported_count": sum(1 for c in claims if c["verification_status"] == "UNSUPPORTED"),
             "unsupported_numeric_count": len(unsupported_numeric),
-            "partially_verified_count": sum(1 for c in claims if c["verification_status"] == "PARTIALLY_VERIFIED"),
+            "partially_verified_count": _count({"PARTIALLY_VERIFIED", "PARTIALLY_SUPPORTED"}),
             "human_review_count": len(human),
             "critical_count": len(critical),
             "critical_unsupported_numeric": [c["claim_text"] for c in unsupported_numeric],
@@ -847,8 +1129,9 @@ class ClaimService:
                         excerpts_json, verification_status, confidence,
                         human_review_status, review_note, severity,
                         number_check_json, unit_check_json, population_check_json,
-                        geography_check_json, time_check_json, meaning_check_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        geography_check_json, time_check_json, meaning_check_json,
+                        provenance_check_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(chapter_id, claim_key) DO UPDATE SET
                         section_id = excluded.section_id,
                         section_key = excluded.section_key,
@@ -868,6 +1151,7 @@ class ClaimService:
                         geography_check_json = excluded.geography_check_json,
                         time_check_json = excluded.time_check_json,
                         meaning_check_json = excluded.meaning_check_json,
+                        provenance_check_json = excluded.provenance_check_json,
                         updated_at = CURRENT_TIMESTAMP
                     """,
                     (
@@ -892,6 +1176,7 @@ class ClaimService:
                         json.dumps(claim.get("geography_check") or {}),
                         json.dumps(claim.get("time_check") or {}),
                         json.dumps(claim.get("meaning_check") or {}),
+                        json.dumps(claim.get("provenance_check") or {}),
                     ),
                 )
 
@@ -905,6 +1190,7 @@ class ClaimService:
             "citation_ids_json", "source_ids_json", "excerpts_json",
             "number_check_json", "unit_check_json", "population_check_json",
             "geography_check_json", "time_check_json", "meaning_check_json",
+            "provenance_check_json",
         ):
             target = key.replace("_json", "")
             try:

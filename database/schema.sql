@@ -1,4 +1,4 @@
--- Product Synthesis Studio Database Schema
+﻿-- Product Synthesis Studio Database Schema
 -- Version 1.0.0
 
 PRAGMA foreign_keys = ON;
@@ -584,6 +584,7 @@ CREATE TABLE IF NOT EXISTS chapter_claims (
     geography_check_json TEXT,
     time_check_json TEXT,
     meaning_check_json TEXT,
+    provenance_check_json TEXT DEFAULT '{}',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,

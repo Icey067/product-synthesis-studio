@@ -100,7 +100,8 @@ def render_dashboard():
                     f"**Manuscript:** {counts['written_chapters']}/{counts['required_chapters']} written · "
                     f"{counts['min_word_compliant_chapters']} at minimum length · "
                     f"{counts['publication_ready_chapters']} publication-ready · "
-                    f"status {assessment['status']}"
+                    f"{counts.get('gate_blocked_chapters', 0)} gate-blocked · "
+                    f"lifecycle {assessment.get('lifecycle_status', 'UNKNOWN')}"
                 )
             with col_prog:
                 st.write(f"Research Completion: **{p['research_progress']}%**")

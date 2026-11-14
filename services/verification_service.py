@@ -158,7 +158,7 @@ class VerificationService:
                         claim.get("review_note") or "Add a supporting citation or rewrite as general explanatory material.",
                         claim=claim["claim_text"],
                     ))
-            elif status == "PARTIALLY_VERIFIED":
+            elif status in {"PARTIALLY_VERIFIED", "PARTIALLY_SUPPORTED"}:
                 details: List[str] = []
                 checks = {
                     "population": claim.get("population_check", {}),
@@ -174,7 +174,7 @@ class VerificationService:
                 if number_values:
                     issues.append(_issue(
                         "statistic_context_mismatch", "HIGH",
-                        "The number appears in the source but the claim is not fully verified"
+                        "The number appears in the source but the claim is not fully supported"
                         + (f" ({', '.join(details)})" if details else "")
                         + f": {claim['claim_text'][:220]}",
                         claim.get("review_note") or "Verify the missing context manually or narrow the claim.",
@@ -183,15 +183,33 @@ class VerificationService:
                 else:
                     issues.append(_issue(
                         "claim_source_relevance", "MEDIUM",
-                        f"Cited excerpt does not clearly support the claim: {claim['claim_text'][:220]}",
+                        f"Cited excerpt only partially supports the claim: {claim['claim_text'][:220]}",
                         claim.get("review_note") or "Cite a more directly relevant passage or verify manually.",
                         claim=claim["claim_text"],
                     ))
-            elif status == "HUMAN_REVIEW":
+            elif status == "SOURCE_FOUND":
+                issues.append(_issue(
+                    "claim_source_relevance", "MEDIUM",
+                    "Citation exists but its excerpt does not support the claim: "
+                    f"{claim['claim_text'][:220]}",
+                    claim.get("review_note") or "Rewrite, qualify, or cite a directly relevant passage.",
+                    claim=claim["claim_text"],
+                ))
+            elif status in {"HUMAN_REVIEW", "HUMAN_REVIEW_REQUIRED"}:
                 issues.append(_issue(
                     "claim_human_review", "MEDIUM",
                     f"Claim requires human verification: {claim['claim_text'][:240]}",
                     claim.get("review_note") or "A human must verify the figure and its context before publication.",
+                    claim=claim["claim_text"],
+                ))
+            elif status == "EXCERPT_MATCHED":
+                # Deterministically matched excerpt.  This does not certify the
+                # claim — it records that a human confirmation is pending.
+                issues.append(_issue(
+                    "claim_pending_human_confirmation", "LOW",
+                    "Excerpt matched; human confirmation pending: "
+                    f"{claim['claim_text'][:220]}",
+                    "Confirm against the source in the Quality Auditor to record a human verification decision.",
                     claim=claim["claim_text"],
                 ))
 

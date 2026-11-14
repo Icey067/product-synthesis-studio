@@ -653,6 +653,15 @@ def _migration_007_publication_quality(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_008_claim_provenance(conn: sqlite3.Connection) -> None:
+    """P2.3.4: store deterministic provenance/attribution checks per claim."""
+    _add_column(conn, "chapter_claims", "provenance_check_json", "TEXT DEFAULT '{}'")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chapter_claims_project_chapter "
+        "ON chapter_claims(project_id, chapter_id)"
+    )
+
+
 MIGRATIONS: List[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "evidence_linking", _migration_001_evidence_linking),
     (2, "generation_contracts", _migration_002_generation_contracts),
@@ -661,6 +670,7 @@ MIGRATIONS: List[tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (5, "project_manuscript_settings", _migration_005_project_manuscript_settings),
     (6, "p2_intelligence", _migration_006_p2_intelligence),
     (7, "publication_quality", _migration_007_publication_quality),
+    (8, "claim_provenance", _migration_008_claim_provenance),
 ]
 
 

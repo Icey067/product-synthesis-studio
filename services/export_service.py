@@ -168,12 +168,47 @@ class ExportService:
             or "The Author"
         )
         title = charter.get("product_title", "Publication")
+        # color_palettes may be a list (legacy) or a dict (new brand schema)
+        raw_palettes = brand.get("color_palettes") or []
+        if isinstance(raw_palettes, dict):
+            palette = raw_palettes
+        elif raw_palettes and isinstance(raw_palettes, list) and isinstance(raw_palettes[0], dict):
+            palette = raw_palettes[0]
+        else:
+            palette = {}
+        primary = (
+            palette.get("primary")
+            or palette.get("ink")
+            or palette.get("Primary")
+            or "#1E3A5F"
+        )
+        accent = (
+            palette.get("accent")
+            or palette.get("terracotta")
+            or palette.get("secondary")
+            or palette.get("Secondary")
+            or "#4A9B8F"
+        )
+        muted = palette.get("muted") or palette.get("cream") or palette.get("secondary") or "#F5F0E8"
+        # Build customer-facing branding — no internal status strings, no duplicate headers
+        publisher = brand.get("publisher_name") or brand.get("brand_name") or "A Practical Guide for Indian Local Businesses"
+        # Author: use neutral descriptor if no real author defined
+        display_author = author if author and author != brand.get("brand_name", "") else publisher
+        cover_subtitle = brand.get("cover_subtitle") or charter.get("subtitle") or ""
+        # Header formatting: if author is distinct from title, include it in header (e.g. Title — Author), otherwise title
+        header_text = f"{title} — {author}" if author and author != title else title
         return {
             "title": title,
-            "author": author,
-            "header": f"{title} — {author}",
-            "footer": f"© {author}. All rights reserved.",
+            "author": display_author,
+            "cover_subtitle": cover_subtitle,
+            "header": header_text,
+            "footer": brand.get("footer_text") or (f"© {author}. All rights reserved." if author else f"{title} — Practical Digital Growth Guide"),
             "cover_concept": brand.get("cover_concept", ""),
+            "disclaimer": brand.get("disclaimer_text") or brand.get("disclaimer") or "",
+            "copyright": brand.get("copyright_text") or brand.get("copyright") or "",
+            "primary": str(primary),
+            "accent": str(accent),
+            "muted": str(muted),
         }
 
     @staticmethod
@@ -252,14 +287,18 @@ class ExportService:
             )
             styles = getSampleStyleSheet()
 
+            primary = colors.HexColor(branding.get("primary") or "#1F2A24")
+            accent = colors.HexColor(branding.get("accent") or "#C45C26")
+            muted_bg = colors.HexColor(branding.get("muted") or "#F6EFE6")
+
             title_style = ParagraphStyle(
                 "CoverTitle", parent=styles["Normal"], fontName=bold_font,
-                fontSize=24, leading=30, textColor=colors.HexColor("#0F172A"),
+                fontSize=24, leading=30, textColor=primary,
                 alignment=TA_CENTER, spaceAfter=15,
             )
             subtitle_style = ParagraphStyle(
                 "CoverSubtitle", parent=styles["Normal"], fontName=body_font,
-                fontSize=13, leading=17, textColor=colors.HexColor("#2563EB"),
+                fontSize=13, leading=17, textColor=accent,
                 alignment=TA_CENTER, spaceAfter=22,
             )
             author_style = ParagraphStyle(
@@ -274,7 +313,7 @@ class ExportService:
             )
             h1_style = ParagraphStyle(
                 "ChapH1", parent=styles["Heading1"], fontName=bold_font,
-                fontSize=16, leading=20, textColor=colors.HexColor("#0F172A"),
+                fontSize=16, leading=20, textColor=primary,
                 spaceBefore=14, spaceAfter=8, keepWithNext=True,
             )
             h2_style = ParagraphStyle(
@@ -320,7 +359,7 @@ class ExportService:
                 ))
             else:
                 story.append(Paragraph(_inline(str(charter.get("subtitle", "Implementation Playbook"))), subtitle_style))
-            story.append(HRFlowable(width="60%", thickness=1.5, color=colors.HexColor("#2563EB"), spaceBefore=10, spaceAfter=18))
+                story.append(HRFlowable(width="60%", thickness=1.5, color=accent, spaceBefore=10, spaceAfter=18))
             story.append(Paragraph(f"By {_inline(branding['author'])}", author_style))
             if draft_label:
                 story.append(Paragraph(f"<b>{_inline(draft_label)}</b>", draft_style))
@@ -370,8 +409,8 @@ class ExportService:
                 toc_data.append(["References", "Cited Empirical Sources"])
                 t = Table(toc_data, colWidths=[3.5 * cm, 13 * cm])
                 t.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F1F5F9")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
+                    ("BACKGROUND", (0, 0), (-1, 0), muted_bg),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), primary),
                     ("FONTNAME", (0, 0), (-1, 0), bold_font),
                     ("FONTNAME", (0, 1), (-1, -1), body_font),
                     ("FONTSIZE", (0, 0), (-1, -1), 9),
@@ -387,7 +426,7 @@ class ExportService:
                 story.append(Paragraph(
                     f"Chapter {ch['chapter_number']}: {_inline(str(ch.get('title', '')))}", h1_style
                 ))
-                story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#2563EB"), spaceAfter=10))
+                story.append(HRFlowable(width="100%", thickness=1, color=accent, spaceAfter=10))
                 if ch.get("purpose"):
                     story.append(Paragraph(f"<b>Core Objective:</b> {_inline(str(ch['purpose']))}", disclaimer_style))
                     story.append(Spacer(1, 0.3 * cm))
@@ -419,6 +458,23 @@ class ExportService:
                     story.append(Spacer(1, 0.2 * cm))
             else:
                 story.append(Paragraph("No external research sources were recorded for this edition.", body_style))
+
+            story.append(PageBreak())
+            story.append(Paragraph("Closing Note", h1_style))
+            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#CBD5E1"), spaceAfter=12))
+            story.append(Paragraph(
+                "This edition is a practical operating playbook. Results depend on local demand, "
+                "honest listing data, consistent weekly execution and platform rules that can change. "
+                "Use the worksheets, keep your own numbers, and treat every ₹ figure you record as "
+                "your shop’s evidence — not a promised market outcome.",
+                body_style,
+            ))
+            story.append(Spacer(1, 0.4 * cm))
+            story.append(Paragraph(
+                f"© {_inline(branding['author'])}. Customer-facing product identity for "
+                f"{_inline(branding['title'])}.",
+                disclaimer_style,
+            ))
 
             doc.build(
                 story,
@@ -668,6 +724,13 @@ class ExportService:
                 r.font.size = Pt(9.5)
             doc.add_page_break()
 
+            if not is_single_chapter and len(active_chapters) > 1:
+                doc.add_heading("Table of Contents", level=1)
+                for ch in active_chapters:
+                    doc.add_paragraph(f"Chapter {ch['chapter_number']}: {ch.get('title', '')}")
+                doc.add_paragraph("References: Cited Empirical Sources")
+                doc.add_page_break()
+
             for idx, ch in enumerate(active_chapters):
                 doc.add_heading(f"Chapter {ch['chapter_number']}: {ch.get('title', '')}", level=1)
                 if ch.get("purpose"):
@@ -695,6 +758,15 @@ class ExportService:
                         doc.add_paragraph(str(s["url"]))
             else:
                 doc.add_paragraph("No external sources recorded.")
+
+            doc.add_page_break()
+            doc.add_heading("Closing Note", level=1)
+            doc.add_paragraph(
+                "This edition is a practical operating playbook. Results depend on local demand, "
+                "honest listing data, consistent weekly execution and platform rules that can change. "
+                "Use the worksheets, keep your own numbers, and treat every ₹ figure you record as "
+                "your shop’s evidence — not a promised market outcome."
+            )
 
             doc.save(str(output_path))
             file_size = os.path.getsize(output_path)
